@@ -20,6 +20,17 @@
     "active": true,
     "targets": ["app"],
     "icon": ["./icons/32x32.png", "./icons/128x128.png", "./icons/128x128@2x.png", "./icons/icon.icns", "./icons/icon.ico"],
+    "resources": {
+      "../backend/start_server.py": "backend/start_server.py",
+      "../backend/stock_predictor_server/*.py": "backend/stock_predictor_server/",
+      "../backend/stock_predictor_server/api/*.py": "backend/stock_predictor_server/api/",
+      "../backend/stock_predictor_server/core/*.py": "backend/stock_predictor_server/core/",
+      "../backend/stock_predictor_server/db/*.py": "backend/stock_predictor_server/db/",
+      "../backend/stock_predictor_server/prompts/*.py": "backend/stock_predictor_server/prompts/",
+      "../backend/stock_predictor_server/schemas/*.py": "backend/stock_predictor_server/schemas/",
+      "../backend/stock_predictor_server/services/*.py": "backend/stock_predictor_server/services/",
+      "../backend/stock_predictor_server/schema.sql": "backend/stock_predictor_server/schema.sql"
+    },
     "category": "public.app-category.utilities",
     "shortDescription": "Stock & fund tracking with AI forecasting",
     "longDescription": "A cross-platform desktop application for tracking stocks and funds, correlating price movements with global news/events, generating multi-horizon forecasts, and self-improving via error calibration."

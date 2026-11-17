@@ -12,12 +12,11 @@ logger = logging.getLogger(__name__)
 
 def _load_calibration_context(ticker: str, sector: str) -> dict[str, Any]:
     """Query recent prediction errors for this ticker/sector and build bias context."""
-    # Collect error_audit records for this ticker
     audits = fetch_all(
-        "SELECT ticker, horizon, percentage_error, directional_correct FROM error_audits "
-        "JOIN predictions USING (prediction_id) WHERE predictions.ticker = ? AND predictions.target_date <= ? "
-        "ORDER BY predictions.target_date DESC LIMIT 30",
-        (ticker, datetime.now(timezone.utc).isoformat(timespec="seconds").replace("+00:00", "Z")),
+        "SELECT p.ticker, p.horizon, a.percentage_error, a.directional_correct "
+        "FROM error_audits a JOIN predictions p ON a.prediction_id = p.id "
+        "WHERE p.ticker = ? ORDER BY a.audit_date DESC LIMIT 30",
+        (ticker,),
     )
 
     context = {"bias_correction": 0.0, "temper_bullish": False}
@@ -61,7 +60,6 @@ def save_prediction(forecast: dict[str, Any]) -> int:
             pred["prediction_date"],
             pred["predicted_price"],
             pred.get("confidence_interval", 0),
-            pred.get("confidence_range", 0),
             pred.get("low", 0),
             pred.get("high", 0),
             pred.get("sentiment_score", 0.0),
@@ -71,8 +69,8 @@ def save_prediction(forecast: dict[str, Any]) -> int:
         query = """
             INSERT OR REPLACE INTO predictions
             (ticker, horizon, prediction_date, predicted_price, confidence_interval,
-             confidence_range, low, high, sentiment_score, key_assumptions, created_at)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+             low, high, sentiment_score, key_assumptions, created_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         """
         execute(query, params, fetch=False)
         inserted += 1

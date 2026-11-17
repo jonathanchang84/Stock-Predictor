@@ -1,5 +1,6 @@
+import { invoke, isTauri } from "@tauri-apps/api/core";
 import { createContext, useCallback, useContext, useEffect, useRef, useState } from "react";
-import type { Asset, PriceHistoryPoint, CatalystEvent, ErrorAudit, ForecastAccuracy, AppSettings, ForecastResult } from "./types";
+import type { Asset, AssetSearchResult, PriceHistoryPoint, CatalystEvent, ErrorAudit, ForecastAccuracy, AppSettings, ForecastResult, NewsArticle } from "./types";
 
 export interface TauriContextValue {
   assets: Asset[];
@@ -9,6 +10,7 @@ export interface TauriContextValue {
   errorAudits: Record<string, ErrorAudit[]>;
   forecastAccuracy: Record<string, ForecastAccuracy[]>;
   settings: AppSettings;
+  news: NewsArticle[];
   loading: boolean;
   error: string | null;
   fetchAssets: () => Promise<void>;
@@ -19,7 +21,9 @@ export interface TauriContextValue {
   fetchErrorSummary: (ticker: string) => Promise<void>;
   fetchForecastAccuracy: () => Promise<void>;
   fetchSettings: () => Promise<void>;
-  addAsset: (asset: Omit<Asset, "id" | "created_at" | "updated_at">) => Promise<void>;
+  addAsset: (asset: Omit<Asset, "id" | "created_at" | "updated_at">) => Promise<boolean>;
+  searchAssets: (query: string) => Promise<AssetSearchResult[]>;
+  searchNews: (query: string) => Promise<boolean>;
   updateAsset: (ticker: string, updates: Partial<Pick<Asset, "name" | "purchase_price" | "quantity" | "date_added" | "notes">>) => Promise<void>;
   deleteAsset: (ticker: string) => Promise<void>;
   runDailyForecast: () => Promise<void>;
@@ -36,14 +40,24 @@ interface TauriState {
   errorAudits: Record<string, ErrorAudit[]>;
   forecastAccuracy: Record<string, ForecastAccuracy[]>;
   settings: AppSettings;
+  news: NewsArticle[];
   loading: boolean;
   error: string | null;
 }
 
-const API_BASE_URL = import.meta.env.VITE_API_BASE_URL ?? "http://127.0.0.1:8000";
+const WEB_API_BASE_URL = import.meta.env.VITE_API_BASE_URL ?? "http://127.0.0.1:8000";
+let tauriApiBaseUrl: Promise<string> | undefined;
+
+async function getApiBaseUrl(): Promise<string> {
+  if (!isTauri()) {
+    return WEB_API_BASE_URL;
+  }
+  tauriApiBaseUrl ??= invoke<string>("backend_url");
+  return tauriApiBaseUrl;
+}
 
 async function apiRequest<T>(path: string, init?: RequestInit): Promise<T> {
-  const response = await fetch(`${API_BASE_URL}${path}`, {
+  const response = await fetch(`${await getApiBaseUrl()}${path}`, {
     ...init,
     headers: { "Content-Type": "application/json", ...init?.headers },
   });
@@ -72,6 +86,7 @@ export const TauriProvider: React.FC<{ children: React.ReactNode }> = ({ childre
     errorAudits: {},
     forecastAccuracy: {},
     settings: {},
+    news: [],
     loading: false,
     error: null,
   });
@@ -198,11 +213,34 @@ export const TauriProvider: React.FC<{ children: React.ReactNode }> = ({ childre
   }, [runRequest]);
 
   const addAsset = useCallback(async (asset: Omit<Asset, "id" | "created_at" | "updated_at">) => {
-    await runRequest(async () => {
+    const added = await runRequest(async () => {
       await apiRequest("/api/assets", { method: "POST", body: JSON.stringify(asset) });
-      const assets = await apiRequest<Asset[]>("/api/assets");
-      setState((current) => ({ ...current, assets }));
+      return true;
     });
+    if (added) {
+      await fetchAssets();
+    }
+    return added === true;
+  }, [fetchAssets, runRequest]);
+
+  const searchAssets = useCallback(async (query: string) => {
+    const results = await runRequest(() =>
+      apiRequest<AssetSearchResult[]>(
+        `/api/assets/search?query=${encodeURIComponent(query)}`,
+      ),
+    );
+    return results ?? [];
+  }, [runRequest]);
+
+  const searchNews = useCallback(async (query: string) => {
+    const results = await runRequest(async () => {
+      const articles = await apiRequest<NewsArticle[]>(
+        `/api/news/search?query=${encodeURIComponent(query)}`,
+      );
+      setState((current) => ({ ...current, news: articles }));
+      return true;
+    });
+    return results === true;
   }, [runRequest]);
 
   const updateAsset = useCallback(async (
@@ -259,6 +297,8 @@ export const TauriProvider: React.FC<{ children: React.ReactNode }> = ({ childre
         fetchForecastAccuracy,
         fetchSettings,
         addAsset,
+        searchAssets,
+        searchNews,
         updateAsset,
         deleteAsset,
         runDailyForecast,

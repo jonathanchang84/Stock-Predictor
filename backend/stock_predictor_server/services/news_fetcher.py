@@ -111,6 +111,7 @@ class RSSNewsSource(NewsSource):
             logger.warning("feedparser not installed; RSS source unavailable")
             return []
 
+        limit = max(1, limit)
         results = []
         try:
             for url in self.feeds:
@@ -118,12 +119,12 @@ class RSSNewsSource(NewsSource):
                 if resp is None:
                     continue
                 feed = self._feedparser.parse(resp.content.decode("utf-8", errors="ignore"))
-                for entry in feed.get("entries", [])[: limit // len(self.feeds)]:
+                for entry in feed.get("entries", []):
                     title = entry.get("title", "")
                     link = entry.get("link", "")
                     summary = entry.get("summary", "") or entry.get("description", "")
                     published = entry.get("published", "")
-                    if query and query.lower() not in title.lower():
+                    if query and query.lower() not in f"{title} {summary}".lower():
                         continue
                     results.append(
                         {
@@ -138,6 +139,7 @@ class RSSNewsSource(NewsSource):
                         return results
         except Exception as e:
             logger.warning("RSS search error: %s", e)
+        return results
 
 class NewsFetcher:
     """Composes news sources with priority."""
@@ -157,5 +159,3 @@ class NewsFetcher:
             except Exception as e:
                 logger.warning("News source %s failed: %s", source.__class__.__name__, e)
         return []
-
-        return results

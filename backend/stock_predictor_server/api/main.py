@@ -6,7 +6,7 @@ from contextlib import asynccontextmanager
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
-from ..db.connection import DB_DIR
+from ..db.connection import initialize_database
 from .routes import router as core_router
 
 logger = logging.getLogger(__name__)
@@ -14,7 +14,7 @@ logger = logging.getLogger(__name__)
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    DB_DIR.mkdir(parents=True, exist_ok=True)
+    initialize_database()
     yield
 
 

@@ -1,13 +1,15 @@
 """SQLite connection manager with WAL mode and low-RAM optimizations."""
 
+import os
 import sqlite3
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Callable, Iterable, Optional
+from typing import Any, Iterable, Optional
 
-DB_DIR = Path(__file__).resolve().parent.parent / "data"
+_DEFAULT_DB_PATH = Path(__file__).resolve().parent.parent / "data" / "stock_predictor.db"
+DB_PATH = Path(os.environ.get("STOCK_PREDICTOR_DB", _DEFAULT_DB_PATH)).expanduser().resolve()
+DB_DIR = DB_PATH.parent
 DB_DIR.mkdir(parents=True, exist_ok=True)
-DB_PATH = DB_DIR / "stock_predictor.db"
 
 
 def get_connection() -> sqlite3.Connection:
@@ -23,6 +25,19 @@ def get_connection() -> sqlite3.Connection:
         """
     )
     return conn
+
+
+def initialize_database() -> None:
+    """Create the database schema if it does not exist yet."""
+    schema_path = Path(__file__).resolve().parent.parent / "schema.sql"
+    if not schema_path.is_file():
+        raise FileNotFoundError(f"Database schema not found: {schema_path}")
+
+    conn = get_connection()
+    try:
+        conn.executescript(schema_path.read_text(encoding="utf-8"))
+    finally:
+        conn.close()
 
 
 def execute(

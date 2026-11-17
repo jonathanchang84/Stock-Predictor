@@ -23,21 +23,14 @@ logging.basicConfig(
     format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
 )
 
-from stock_predictor_server.db.connection import get_connection, DB_DIR, DB_PATH
+from stock_predictor_server.db.connection import DB_DIR, DB_PATH, initialize_database
 from stock_predictor_server.api.main import app
 
 
 def init_db():
     """Create directory and tables if they don't exist."""
     DB_DIR.mkdir(parents=True, exist_ok=True)
-    if not DB_PATH.exists():
-        DB_PATH.touch()
-    conn = get_connection()
-    schema_path = BACKEND_ROOT / "schema.sql"
-    if schema_path.exists():
-        with open(schema_path) as f:
-            conn.executescript(f.read())
-    conn.close()
+    initialize_database()
     logging.info("Database initialized: %s", DB_PATH)
 
 

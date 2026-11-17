@@ -13,6 +13,13 @@ export interface Asset {
   updated_at: string;
 }
 
+export interface AssetSearchResult {
+  ticker: string;
+  name: string;
+  asset_type: string;
+  exchange: string;
+}
+
 export interface PriceHistoryPoint {
   date: string;
   open: number;
@@ -92,4 +99,12 @@ export interface ForecastResult {
   predictions: Record<string, HorizonForecast>;
   confidence_band: Record<string, number>;
   calibration_context_applied: boolean;
+}
+
+export interface NewsArticle {
+  source: string;
+  title: string;
+  summary: string;
+  url: string;
+  published: string;
 }

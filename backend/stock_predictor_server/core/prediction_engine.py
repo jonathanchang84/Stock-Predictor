@@ -5,7 +5,7 @@ Generates projections for 9 exact horizons: 1d, 7d, 1m, 6m, 1y, 3y, 5y, 10y, 20y
 
 import logging
 from datetime import datetime, timezone
-from typing import Any
+from typing import Any, Optional
 
 import numpy as np
 import pandas as pd
@@ -30,7 +30,7 @@ def generate_forecast(
     if price_history is None or len(price_history) < 20:
         logger.warning("Insufficient price history for %s (%d rows); using naive baseline",
                        ticker, len(price_history) if price_history is not None else 0)
-        return _naive_forecast(ticker, today)
+        return _naive_forecast(ticker, today, price_history)
 
     df = price_history.copy()
     if isinstance(df.index, pd.DatetimeIndex):
@@ -42,7 +42,7 @@ def generate_forecast(
     close = df["close"]
     recent = close.dropna()
     if recent.empty:
-        return _naive_forecast(ticker, today)
+        return _naive_forecast(ticker, today, df)
 
     short_term = _statistical_short_term_forecast(close, recent)
     long_term = _statistical_long_term_forecast(close, recent)
@@ -71,8 +71,7 @@ def generate_forecast(
             "sentiment_score": short_term.get("sentiment_score", 0.0),
             "horizon": h,
             "prediction_date": today,
-            "key_assumptions": _build_key_assumptions(calendar_growth=0.05, news_neutral=True,
-                                                      calibration_applied=bool(calibration_context)),
+            "key_assumptions": _build_key_assumptions(bool(calibration_context)),
         }
 
     return {
@@ -90,17 +89,34 @@ def generate_forecast(
     }
 
 
-def _naive_forecast(ticker: str, today: str) -> dict[str, Any]:
+def _naive_forecast(
+    ticker: str,
+    today: str,
+    price_history: Optional[pd.DataFrame] = None,
+) -> dict[str, Any]:
+    latest_price = 100.0
+    if price_history is not None and "close" in price_history:
+        close = pd.to_numeric(price_history["close"], errors="coerce").dropna()
+        if not close.empty and np.isfinite(close.iloc[-1]) and close.iloc[-1] > 0:
+            latest_price = float(close.iloc[-1])
+
     return {
         "ticker": ticker,
         "generated_at": datetime.now(timezone.utc).isoformat(timespec="seconds").replace("+00:00", "Z"),
-        "predictions": {h: {"predicted_price": 100.0, "confidence_interval": 100.0,
+        "predictions": {h: {"predicted_price": latest_price, "confidence_interval": latest_price,
                             "sentiment_score": 0.0, "horizon": h, "prediction_date": today,
                             "key_assumptions": "Insufficient historical data; using flat baseline."}
                         for h in HORIZONS},
         "confidence_band": {},
         "calibration_context_applied": False,
     }
+
+
+def _build_key_assumptions(calibration_applied: bool) -> str:
+    assumptions = "Forecast extrapolates historical price trends and volatility; external news is not modeled."
+    if calibration_applied:
+        assumptions += " Recent forecast-error calibration was applied."
+    return assumptions
 
 
 def _statistical_short_term_forecast(close: pd.Series, recent: pd.Series) -> dict[str, Any]:
