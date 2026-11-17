@@ -20,6 +20,7 @@ def get_connection() -> sqlite3.Connection:
         """
         PRAGMA journal_mode = WAL;
         PRAGMA synchronous = NORMAL;
+        PRAGMA foreign_keys = ON;
         PRAGMA temp_store = MEMORY;
         PRAGMA mmap_size = 268435456;  -- 256 MB mmap for index-heavy queries
         """

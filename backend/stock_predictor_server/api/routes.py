@@ -8,12 +8,44 @@ from typing import Any
 from fastapi import APIRouter, HTTPException
 
 from ..core import error_auditor, forecast_service
-from ..core.prediction_engine import generate_forecast
-from ..db.connection import execute, executemany, fetch_all
+from ..core.prediction_engine import generate_forecast as build_forecast
+from ..db.connection import execute, executemany, fetch_all, fetch_one, get_connection
 from ..services import market_data, news_fetcher
 
 router = APIRouter(prefix="/api", tags=["core"])
 logger = logging.getLogger(__name__)
+
+SP500_ASSETS = [
+    {
+        "ticker": "SPY",
+        "name": "SPDR S&P 500 ETF Trust",
+        "asset_type": "etf",
+        "exchange": "NYSE Arca",
+    },
+    {
+        "ticker": "VOO",
+        "name": "Vanguard S&P 500 ETF",
+        "asset_type": "etf",
+        "exchange": "NYSE Arca",
+    },
+    {
+        "ticker": "IVV",
+        "name": "iShares Core S&P 500 ETF",
+        "asset_type": "etf",
+        "exchange": "NYSE Arca",
+    },
+    {
+        "ticker": "SPYM",
+        "name": "State Street SPDR Portfolio S&P 500 ETF",
+        "asset_type": "etf",
+        "exchange": "NYSE Arca",
+    },
+]
+
+
+def _is_sp500_query(query: str) -> bool:
+    normalized = re.sub(r"[^a-z0-9]", "", query.casefold())
+    return normalized.startswith("sp500") or normalized.startswith("sandp500")
 
 
 # --- Asset management -------------------------------------------------------------------
@@ -51,11 +83,73 @@ def add_asset(asset: dict[str, Any]):
         raise HTTPException(status_code=400, detail=str(e))
 
 
+@router.put("/assets/{ticker}")
+def update_asset(ticker: str, updates: dict[str, Any]):
+    normalized_ticker = ticker.strip().upper()
+    allowed_fields = {"name", "asset_type", "notes"}
+    unknown_fields = set(updates) - allowed_fields
+    if unknown_fields:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Unsupported asset fields: {', '.join(sorted(unknown_fields))}",
+        )
+    if not updates:
+        raise HTTPException(status_code=400, detail="At least one asset field is required")
+
+    values = {}
+    for field in ("name", "notes"):
+        if field in updates:
+            if not isinstance(updates[field], str):
+                raise HTTPException(status_code=400, detail=f"{field} must be a string")
+            values[field] = updates[field].strip()
+
+    if "asset_type" in updates:
+        asset_type = str(updates["asset_type"]).strip().lower()
+        if asset_type not in {"stock", "etf", "mutual_fund", "index_fund"}:
+            raise HTTPException(status_code=400, detail="Invalid asset_type")
+        values["asset_type"] = asset_type
+
+    if not fetch_one("SELECT id FROM assets WHERE ticker = ?", (normalized_ticker,)):
+        raise HTTPException(status_code=404, detail=f"Asset {normalized_ticker} not found")
+
+    values["updated_at"] = datetime.now(timezone.utc).isoformat(timespec="seconds").replace("+00:00", "Z")
+    assignments = ", ".join(f"{field} = ?" for field in values)
+    execute(
+        f"UPDATE assets SET {assignments} WHERE ticker = ?",
+        (*values.values(), normalized_ticker),
+        fetch=False,
+    )
+    return {"ticker": normalized_ticker, "message": "Asset updated"}
+
+
+@router.delete("/assets/{ticker}")
+def delete_asset(ticker: str):
+    normalized_ticker = ticker.strip().upper()
+    conn = get_connection()
+    try:
+        conn.execute("DELETE FROM forecast_accuracy WHERE ticker = ?", (normalized_ticker,))
+        cursor = conn.execute("DELETE FROM assets WHERE ticker = ?", (normalized_ticker,))
+        if cursor.rowcount == 0:
+            conn.rollback()
+            raise HTTPException(status_code=404, detail=f"Asset {normalized_ticker} not found")
+        conn.commit()
+        return {"ticker": normalized_ticker, "message": "Asset deleted"}
+    except HTTPException:
+        raise
+    except Exception:
+        conn.rollback()
+        raise
+    finally:
+        conn.close()
+
+
 @router.get("/assets/search")
 def search_assets(query: str, limit: int = 10):
     search_term = query.strip()
     if not search_term:
         raise HTTPException(status_code=400, detail="query must not be empty")
+    if _is_sp500_query(search_term):
+        return [asset.copy() for asset in SP500_ASSETS[:min(max(limit, 1), 20)]]
 
     try:
         import yfinance as yf
@@ -179,6 +273,17 @@ def _fetch_and_store_price_history(ticker: str) -> None:
     )
 
 
+def _price_history_frame(rows: list[Any]):
+    import pandas as pd
+
+    frame = pd.DataFrame([dict(row) for row in rows])
+    if frame.empty:
+        return frame
+    frame["date"] = pd.to_datetime(frame["date"])
+    frame = frame.set_index("date").sort_index()
+    return frame[["open", "high", "low", "close", "volume"]]
+
+
 @router.get("/news/search")
 def search_news(query: str, limit: int = 20):
     search_term = query.strip()
@@ -234,11 +339,7 @@ def generate_forecast(payload: dict[str, Any]):
     if not rows:
         raise HTTPException(status_code=404, detail=f"No price history for {ticker}")
 
-    import pandas as pd
-    df = pd.DataFrame(rows)
-    df["date"] = pd.to_datetime(df["date"])
-    df = df.set_index("date").sort_index()
-    df = df[["open", "high", "low", "close", "volume"]]
+    df = _price_history_frame(rows)
 
     news_query = payload.get("news_query", ticker)
     news_results = payload.get("news_context", [])
@@ -249,7 +350,13 @@ def generate_forecast(payload: dict[str, Any]):
 
     calibration = forecast_service._load_calibration_context(ticker, "tech" if "tech" in news_query.lower() else "general")
 
-    result = generate_forecast(ticker, df, news_context, calibration, datetime.now(timezone.utc).isoformat(timespec="seconds").replace("+00:00", "Z"))
+    result = build_forecast(
+        ticker,
+        df,
+        news_context,
+        calibration,
+        datetime.now(timezone.utc).isoformat(timespec="seconds").replace("+00:00", "Z"),
+    )
     forecast_service.save_prediction(result)
 
     return result
@@ -275,11 +382,7 @@ def run_daily_forecast():
             )
             if not rows:
                 continue
-            import pandas as pd
-            df = pd.DataFrame(rows)
-            df["date"] = pd.to_datetime(df["date"])
-            df = df.set_index("date").sort_index()
-            df = df[["open", "high", "low", "close", "volume"]]
+            df = _price_history_frame(rows)
 
             news = [{"title": f"News for {ticker}", "summary": ""}]
             cal = forecast_service._load_calibration_context(ticker, "general")

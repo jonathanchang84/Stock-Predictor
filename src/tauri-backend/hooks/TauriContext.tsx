@@ -24,8 +24,8 @@ export interface TauriContextValue {
   addAsset: (asset: Omit<Asset, "id" | "created_at" | "updated_at">) => Promise<boolean>;
   searchAssets: (query: string) => Promise<AssetSearchResult[]>;
   searchNews: (query: string) => Promise<boolean>;
-  updateAsset: (ticker: string, updates: Partial<Pick<Asset, "name" | "purchase_price" | "quantity" | "date_added" | "notes">>) => Promise<void>;
-  deleteAsset: (ticker: string) => Promise<void>;
+  updateAsset: (ticker: string, updates: Partial<Pick<Asset, "name" | "asset_type" | "notes">>) => Promise<boolean>;
+  deleteAsset: (ticker: string) => Promise<boolean>;
   runDailyForecast: () => Promise<void>;
   updateSettings: (settings: AppSettings) => Promise<void>;
 }
@@ -245,24 +245,40 @@ export const TauriProvider: React.FC<{ children: React.ReactNode }> = ({ childre
 
   const updateAsset = useCallback(async (
     ticker: string,
-    updates: Partial<Pick<Asset, "name" | "purchase_price" | "quantity" | "date_added" | "notes">>,
+    updates: Partial<Pick<Asset, "name" | "asset_type" | "notes">>,
   ) => {
-    await runRequest(async () => {
+    const assets = await runRequest(async () => {
       await apiRequest(`/api/assets/${encodeURIComponent(ticker)}`, {
         method: "PUT",
         body: JSON.stringify(updates),
       });
-      const assets = await apiRequest<Asset[]>("/api/assets");
-      setState((current) => ({ ...current, assets }));
+      return apiRequest<Asset[]>("/api/assets");
     });
+    if (!assets) {
+      return false;
+    }
+    setState((current) => ({ ...current, assets }));
+    return true;
   }, [runRequest]);
 
   const deleteAsset = useCallback(async (ticker: string) => {
-    await runRequest(async () => {
+    const assets = await runRequest(async () => {
       await apiRequest(`/api/assets/${encodeURIComponent(ticker)}`, { method: "DELETE" });
-      const assets = await apiRequest<Asset[]>("/api/assets");
-      setState((current) => ({ ...current, assets }));
+      return apiRequest<Asset[]>("/api/assets");
     });
+    if (!assets) {
+      return false;
+    }
+    setState((current) => {
+      const priceHistory = { ...current.priceHistory };
+      const catalysts = { ...current.catalysts };
+      const predictions = { ...current.predictions };
+      delete priceHistory[ticker];
+      delete catalysts[ticker];
+      delete predictions[ticker];
+      return { ...current, assets, priceHistory, catalysts, predictions };
+    });
+    return true;
   }, [runRequest]);
 
   const runDailyForecast = useCallback(async () => {

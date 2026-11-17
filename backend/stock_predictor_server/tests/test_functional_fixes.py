@@ -157,6 +157,13 @@ class RSSNewsSourceTests(unittest.TestCase):
 
         self.assertEqual(error.exception.status_code, 400)
 
+    def test_s_and_p_500_search_always_returns_matching_funds(self):
+        results = routes.search_assets("S&P 500")
+
+        self.assertIn("SPY", {result["ticker"] for result in results})
+        self.assertIn("VOO", {result["ticker"] for result in results})
+        self.assertTrue(all(result["asset_type"] == "etf" for result in results))
+
     def test_returns_matching_entries_from_rss(self):
         class FakeResponse:
             content = b"<rss />"
@@ -272,5 +279,82 @@ class DatabaseInitializationTests(unittest.TestCase):
                     forecast_service._load_calibration_context("ACME", "general"),
                     {"bias_correction": 0.0, "temper_bullish": False},
                 )
+        finally:
+            connection.DB_PATH = original_path
+
+    def test_manual_forecast_reads_sqlite_rows_with_named_columns(self):
+        original_path = connection.DB_PATH
+        try:
+            with tempfile.TemporaryDirectory() as directory:
+                connection.DB_PATH = Path(directory) / "forecast-route.db"
+                connection.initialize_database()
+                connection.execute(
+                    "INSERT INTO assets (ticker, asset_type, name, date_added) VALUES (?, ?, ?, ?)",
+                    ("ACME", "stock", "Example", "2025-01-01"),
+                )
+                for index in range(25):
+                    day = datetime(2025, 1, 1) + timedelta(days=index)
+                    price = 40.0 + index
+                    connection.execute(
+                        "INSERT INTO price_history (ticker, date, open, high, low, close, volume) "
+                        "VALUES (?, ?, ?, ?, ?, ?, ?)",
+                        ("ACME", day.date().isoformat(), price, price, price, price, 1000),
+                    )
+
+                result = routes.generate_forecast({"ticker": "ACME"})
+
+                self.assertEqual(len(result["predictions"]), 9)
+                self.assertEqual(
+                    connection.fetch_one("SELECT COUNT(*) AS count FROM predictions")["count"],
+                    9,
+                )
+        finally:
+            connection.DB_PATH = original_path
+
+    def test_updating_and_deleting_assets_manages_related_data(self):
+        original_path = connection.DB_PATH
+        try:
+            with tempfile.TemporaryDirectory() as directory:
+                connection.DB_PATH = Path(directory) / "asset-crud.db"
+                connection.initialize_database()
+                connection.execute(
+                    "INSERT INTO assets (ticker, asset_type, name, date_added) VALUES (?, ?, ?, ?)",
+                    ("ACME", "stock", "Example", "2025-01-01"),
+                )
+                connection.execute(
+                    "INSERT INTO price_history (ticker, date, close) VALUES (?, ?, ?)",
+                    ("ACME", "2025-01-02", 42.0),
+                )
+                prediction_id = connection.execute(
+                    "INSERT INTO predictions (ticker, horizon, prediction_date, predicted_price) "
+                    "VALUES (?, ?, ?, ?)",
+                    ("ACME", "1d", "2025-01-02", 43.0),
+                )
+                connection.execute(
+                    "INSERT INTO error_audits "
+                    "(prediction_id, audit_date, actual_close, absolute_error, percentage_error, directional_correct) "
+                    "VALUES (?, ?, ?, ?, ?, ?)",
+                    (prediction_id, "2025-01-03", 42.0, 1.0, 0.02, 1),
+                )
+                connection.execute(
+                    "INSERT INTO forecast_accuracy (ticker, horizon) VALUES (?, ?)",
+                    ("ACME", "1d"),
+                )
+
+                routes.update_asset(
+                    "ACME",
+                    {"name": "Updated Example", "asset_type": "etf", "notes": "watch"},
+                )
+                updated = connection.fetch_one(
+                    "SELECT name, asset_type, notes FROM assets WHERE ticker = ?",
+                    ("ACME",),
+                )
+                self.assertEqual(tuple(updated), ("Updated Example", "etf", "watch"))
+
+                routes.delete_asset("ACME")
+
+                for table in ("assets", "price_history", "predictions", "error_audits", "forecast_accuracy"):
+                    count = connection.fetch_one(f"SELECT COUNT(*) AS count FROM {table}")["count"]
+                    self.assertEqual(count, 0, table)
         finally:
             connection.DB_PATH = original_path

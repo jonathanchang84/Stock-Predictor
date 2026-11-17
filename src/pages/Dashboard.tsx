@@ -1,7 +1,7 @@
 import React from "react";
 import { LineChart, Line, XAxis, YAxis, CartesianGrid, Tooltip, ResponsiveContainer } from "recharts";
 import { useTauri } from "../tauri-backend/hooks";
-import type { AssetSearchResult } from "../tauri-backend/hooks/types";
+import type { Asset, AssetSearchResult } from "../tauri-backend/hooks/types";
 
 const TICKER_PATTERN = /^[A-Z0-9.^=_-]+$/i;
 
@@ -14,6 +14,8 @@ const Dashboard: React.FC = () => {
     loading,
     error,
     addAsset,
+    updateAsset,
+    deleteAsset,
     searchAssets,
     fetchForecast,
     fetchPriceHistory,
@@ -25,6 +27,11 @@ const Dashboard: React.FC = () => {
   const [assetType, setAssetType] = React.useState("stock");
   const [assetSearchResults, setAssetSearchResults] = React.useState<AssetSearchResult[]>([]);
   const [selectedAsset, setSelectedAsset] = React.useState<AssetSearchResult | null>(null);
+  const [editingAsset, setEditingAsset] = React.useState<Asset | null>(null);
+  const [editName, setEditName] = React.useState("");
+  const [editType, setEditType] = React.useState("stock");
+  const [editNotes, setEditNotes] = React.useState("");
+  const [editError, setEditError] = React.useState<string | null>(null);
 
   React.useEffect(() => {
     if (assets.length === 0) {
@@ -62,9 +69,24 @@ const Dashboard: React.FC = () => {
 
   const handleAddAsset = async (event: React.FormEvent<HTMLFormElement>) => {
     event.preventDefault();
-    const ticker = (selectedAsset?.ticker ?? assetQuery.trim()).toUpperCase();
+    if (!selectedAsset) {
+      const results = await searchAssets(assetQuery.trim());
+      setAssetSearchResults(results);
+      setFormError(
+        results.length
+          ? "Select a matching ticker from the results before adding it."
+          : "No matching assets found. Check the symbol or try another name.",
+      );
+      return;
+    }
+
+    const ticker = selectedAsset.ticker.toUpperCase();
+    if (assets.some((asset) => asset.ticker === ticker)) {
+      setFormError(`${ticker} is already being tracked.`);
+      return;
+    }
     if (!TICKER_PATTERN.test(ticker)) {
-      setFormError("Search by fund name and select a matching ticker, or enter a ticker symbol.");
+      setFormError("Select a valid matching ticker from the search results.");
       return;
     }
 
@@ -88,11 +110,47 @@ const Dashboard: React.FC = () => {
     }
   };
 
+  const startEditingAsset = (asset: Asset) => {
+    setEditingAsset(asset);
+    setEditName(asset.name);
+    setEditType(asset.asset_type);
+    setEditNotes(asset.notes);
+    setEditError(null);
+  };
+
+  const handleUpdateAsset = async (event: React.FormEvent<HTMLFormElement>) => {
+    event.preventDefault();
+    if (!editingAsset) {
+      return;
+    }
+    const updated = await updateAsset(editingAsset.ticker, {
+      name: editName.trim(),
+      asset_type: editType,
+      notes: editNotes.trim(),
+    });
+    if (updated) {
+      setEditingAsset(null);
+    } else {
+      setEditError("Could not update this asset. See the page error for details.");
+    }
+  };
+
+  const handleDeleteAsset = async (asset: Asset) => {
+    if (!window.confirm(`Stop tracking ${asset.name || asset.ticker}? Its saved history and forecasts will be deleted.`)) {
+      return;
+    }
+    await deleteAsset(asset.ticker);
+  };
+
   const selectSearchResult = (result: AssetSearchResult) => {
     setSelectedAsset(result);
     setAssetQuery(result.ticker);
     setAssetType(result.asset_type);
-    setFormError(null);
+    setFormError(
+      assets.some((asset) => asset.ticker === result.ticker)
+        ? `${result.ticker} is already being tracked.`
+        : null,
+    );
   };
 
   return (
@@ -158,6 +216,39 @@ const Dashboard: React.FC = () => {
           >
             Generate Forecast
           </button>
+        </div>
+      )}
+
+      {assets.length > 0 && (
+        <div className="bg-surface-50 border border-surface-200 rounded-xl p-4">
+          <h2 className="text-lg font-semibold text-surface-800 mb-3">Manage tracked assets</h2>
+          <div className="divide-y divide-surface-200">
+            {assets.map((asset) => (
+              <div key={asset.ticker} className="flex flex-col gap-3 py-3 sm:flex-row sm:items-center sm:justify-between">
+                <div>
+                  <div className="font-medium text-surface-800">{asset.name || asset.ticker}</div>
+                  <div className="text-sm text-surface-500">{asset.ticker} · {asset.asset_type}</div>
+                </div>
+                <div className="flex gap-2">
+                  <button
+                    type="button"
+                    onClick={() => startEditingAsset(asset)}
+                    className="rounded-lg border border-surface-300 px-3 py-2 text-sm text-surface-700"
+                  >
+                    Edit
+                  </button>
+                  <button
+                    type="button"
+                    onClick={() => void handleDeleteAsset(asset)}
+                    disabled={loading}
+                    className="rounded-lg border border-red-300 px-3 py-2 text-sm text-red-700 disabled:opacity-50"
+                  >
+                    Delete
+                  </button>
+                </div>
+              </div>
+            ))}
+          </div>
         </div>
       )}
 
@@ -284,8 +375,65 @@ const Dashboard: React.FC = () => {
               <button type="button" onClick={() => setIsAddAssetOpen(false)} className="rounded-lg border border-surface-300 px-4 py-2 text-surface-700">
                 Cancel
               </button>
+              <button
+                type="submit"
+                disabled={loading || !assetQuery.trim()}
+                className="rounded-lg bg-brand-600 px-4 py-2 text-white disabled:opacity-50"
+              >
+                {selectedAsset ? "Add Asset" : "Check Match"}
+              </button>
+            </div>
+          </form>
+        </div>
+      )}
+
+      {editingAsset && (
+        <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/40 p-4">
+          <form onSubmit={handleUpdateAsset} className="w-full max-w-lg space-y-4 rounded-xl bg-white p-6 shadow-xl">
+            <div className="flex items-center justify-between">
+              <div>
+                <h2 className="text-xl font-semibold text-surface-800">Edit tracked asset</h2>
+                <p className="text-sm text-surface-500">{editingAsset.ticker}</p>
+              </div>
+              <button type="button" onClick={() => setEditingAsset(null)} aria-label="Close" className="text-surface-500">✕</button>
+            </div>
+            <label className="block text-sm font-medium text-surface-700">
+              Display name
+              <input
+                value={editName}
+                onChange={(event) => setEditName(event.target.value)}
+                className="mt-1 block w-full rounded-md border border-surface-300 px-3 py-2"
+              />
+            </label>
+            <label className="block text-sm font-medium text-surface-700">
+              Asset type
+              <select
+                value={editType}
+                onChange={(event) => setEditType(event.target.value)}
+                className="mt-1 block w-full rounded-md border border-surface-300 px-3 py-2 bg-white"
+              >
+                <option value="stock">Stock</option>
+                <option value="etf">ETF</option>
+                <option value="mutual_fund">Mutual fund</option>
+                <option value="index_fund">Index fund</option>
+              </select>
+            </label>
+            <label className="block text-sm font-medium text-surface-700">
+              Notes
+              <textarea
+                value={editNotes}
+                onChange={(event) => setEditNotes(event.target.value)}
+                rows={3}
+                className="mt-1 block w-full rounded-md border border-surface-300 px-3 py-2"
+              />
+            </label>
+            {editError && <p role="alert" className="text-sm text-red-600">{editError}</p>}
+            <div className="flex justify-end gap-2">
+              <button type="button" onClick={() => setEditingAsset(null)} className="rounded-lg border border-surface-300 px-4 py-2 text-surface-700">
+                Cancel
+              </button>
               <button type="submit" disabled={loading} className="rounded-lg bg-brand-600 px-4 py-2 text-white disabled:opacity-50">
-                Add Asset
+                Save Changes
               </button>
             </div>
           </form>

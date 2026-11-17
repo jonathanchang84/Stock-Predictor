@@ -18,7 +18,10 @@ starting the backend manually to use a specific path.
 
 Add assets by ticker or fund name and select the matching exchange listing.
 Price history is fetched from the earliest date the market-data provider makes
-available for that symbol; coverage varies by fund and exchange.
+available for that symbol; coverage varies by fund and exchange. Searching
+"S&P 500" includes established ETF listings. Tracked assets can be edited or
+deleted from the market overview; deleting an asset also removes its saved
+price history and forecasts.
 
 ```sh
 npm ci

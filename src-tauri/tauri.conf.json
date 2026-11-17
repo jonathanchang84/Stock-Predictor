@@ -1,7 +1,7 @@
 {
   "productName": "Stock Predictor",
   "identifier": "com.stockpredictor.desktop",
-  "version": "0.1.0",
+  "version": "0.1.2",
   "build": {
     "beforeDevCommand": "npm run dev",
     "beforeBuildCommand": "npm run build",
