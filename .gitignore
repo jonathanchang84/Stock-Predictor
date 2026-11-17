@@ -1,0 +1,29 @@
+# Dependencies
+node_modules/
+# Build output
+dist/
+frontend/dist/
+*.tsbuildinfo
+vite.config.js
+vite.config.d.ts
+backend/.data/
+backend/stock_predictor_server/data/*.db*
+backend/stock_predictor_server/__pycache__/
+backend/venv/
+backend/.venv/
+
+# OS / editor
+.DS_Store
+*.swp
+.idea/
+.vscode/
+
+# Tauri / macOS
+src-tauri/target/
+src-tauri/bundle/*
+*.dmg
+*.app/*
+
+# Secrets
+*.env
+!.env.example

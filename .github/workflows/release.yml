@@ -1,0 +1,32 @@
+name: Publish macOS app
+
+on:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+          cache: npm
+      - uses: dtolnay/rust-toolchain@stable
+      - run: npm ci
+      - run: npm run tauri:build
+      - name: Package and publish release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          ditto -c -k --sequesterRsrc --keepParent \
+            "src-tauri/target/release/bundle/macos/Stock Predictor.app" \
+            "Stock-Predictor-macos.zip"
+          gh release create "$GITHUB_REF_NAME" "Stock-Predictor-macos.zip" \
+            --title "Stock Predictor $GITHUB_REF_NAME" \
+            --generate-notes
