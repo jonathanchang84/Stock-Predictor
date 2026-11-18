@@ -10,11 +10,13 @@ from typing import Any, Optional
 import numpy as np
 import pandas as pd
 
+from .context_signals import build_context_signals
+
 logger = logging.getLogger(__name__)
 
 # Exact forecast horizons (must match horizon enum)
 HORIZONS = ["1d", "7d", "1m", "6m", "1y", "3y", "5y", "10y", "20y"]
-MODEL_VERSION = "price-momentum-v3"
+MODEL_VERSION = "price-context-v1"
 INTERVAL_COVERAGE = 0.9
 MIN_CALIBRATION_SAMPLES = 20
 
@@ -28,12 +30,15 @@ def generate_forecast(
     news_context: list[dict[str, Any]],
     calibration_context: dict[str, Any],
     today: str,
+    market_context: Optional[dict[str, Any]] = None,
 ) -> dict[str, Any]:
-    """Produce forecasts for all horizons and attach sourced news as context only."""
+    """Produce forecasts with bounded, sourced context overlays."""
     if price_history is None or len(price_history) < 20:
         logger.warning("Insufficient price history for %s (%d rows); using naive baseline",
                        ticker, len(price_history) if price_history is not None else 0)
-        return _naive_forecast(ticker, today, price_history)
+        return _naive_forecast(
+            ticker, today, price_history, news_context, market_context
+        )
 
     df = price_history.copy()
     if isinstance(df.index, pd.DatetimeIndex):
@@ -45,15 +50,23 @@ def generate_forecast(
     close = pd.to_numeric(df["close"], errors="coerce").dropna()
     recent = close.dropna()
     if recent.empty:
-        return _naive_forecast(ticker, today, df)
+        return _naive_forecast(ticker, today, df, news_context, market_context)
 
     short_term = _statistical_short_term_forecast(close, recent)
     long_term = _statistical_long_term_forecast(close, recent)
 
     predictions = {}
+    context_signals: dict[str, dict[str, Any]] = {}
     for h in HORIZONS:
         days = DAYS[h]
         stat_proj = _statistical_project(close, days)
+        signals = build_context_signals(
+            news_context,
+            market_context,
+            days,
+            today,
+        )
+        context_signals[h] = signals
 
         if days <= 180:
             momentum_proj = _momentum_project(recent, days)
@@ -72,6 +85,22 @@ def generate_forecast(
                 f"a {long_term['baseline_cagr'] * 100:.1f}% nominal baseline, with the "
                 "projection capped at -8% to +12% annualized."
             )
+
+        if signals["news_adjustment_pct"]:
+            blend *= 1 + signals["news_adjustment_pct"] / 100
+        if signals["fundamental_annualized_adjustment_pct"]:
+            years = days / 365.25
+            latest_price = float(recent.iloc[-1])
+            base_growth = (blend / latest_price) ** (1 / years) - 1
+            adjusted_growth = float(
+                np.clip(
+                    base_growth
+                    + signals["fundamental_annualized_adjustment_pct"] / 100,
+                    -0.08,
+                    0.12,
+                )
+            )
+            blend = latest_price * (1 + adjusted_growth) ** years
 
         horizon_calibration = calibration_context.get("horizons", {}).get(h, {})
         residuals = horizon_calibration.get("residuals", [])
@@ -98,6 +127,13 @@ def generate_forecast(
             days,
             residuals,
         )
+        event_multiplier = signals["event_risk_multiplier"]
+        if event_multiplier > 1:
+            lower_distance = max(0.0, np.log(blend / max(low, 0.01)))
+            upper_distance = max(0.0, np.log(max(high, blend) / blend))
+            low = max(0.01, blend * np.exp(-lower_distance * event_multiplier))
+            high = blend * np.exp(upper_distance * event_multiplier)
+            interval_method += "; widened for scheduled-event risk"
         predictions[h] = {
             "predicted_price": round(max(blend, 0.01), 2),
             "confidence_interval": INTERVAL_COVERAGE,
@@ -115,6 +151,7 @@ def generate_forecast(
                 days,
                 len(residuals) >= MIN_CALIBRATION_SAMPLES,
                 model_explanation,
+                signals,
             ),
         }
 
@@ -124,6 +161,8 @@ def generate_forecast(
         "generated_at": datetime.now(timezone.utc).isoformat(timespec="seconds").replace("+00:00", "Z"),
         "predictions": predictions,
         "news_context": _normalize_news_context(news_context),
+        "market_context": market_context or _empty_market_context(ticker, today),
+        "context_signals": context_signals,
         "confidence_band": {
             "1d": predictions["1d"]["low"],
             "7d": predictions["7d"]["low"],
@@ -142,6 +181,8 @@ def _naive_forecast(
     ticker: str,
     today: str,
     price_history: Optional[pd.DataFrame] = None,
+    news_context: Optional[list[dict[str, Any]]] = None,
+    market_context: Optional[dict[str, Any]] = None,
 ) -> dict[str, Any]:
     latest_price = 100.0
     if price_history is not None and "close" in price_history:
@@ -161,9 +202,34 @@ def _naive_forecast(
                             "sentiment_score": 0.0, "horizon": h, "prediction_date": today,
                             "key_assumptions": "Insufficient historical data; using flat baseline."}
                         for h in HORIZONS},
-        "news_context": [],
+        "news_context": _normalize_news_context(news_context or []),
+        "market_context": market_context or _empty_market_context(ticker, today),
+        "context_signals": {
+            horizon: {
+                "news_sentiment_score": 0.0,
+                "news_articles_used": 0,
+                "news_adjustment_pct": 0.0,
+                "fundamental_score": None,
+                "fundamental_metrics_used": 0,
+                "fundamental_annualized_adjustment_pct": 0.0,
+                "event_risk_multiplier": 1.0,
+                "relevant_events": [],
+            }
+            for horizon in HORIZONS
+        },
         "confidence_band": {},
         "calibration_context_applied": False,
+    }
+
+
+def _empty_market_context(ticker: str, today: str) -> dict[str, Any]:
+    return {
+        "ticker": ticker,
+        "source": "unavailable",
+        "captured_at": today,
+        "fundamentals": {},
+        "upcoming_events": [],
+        "warnings": ["Market context was not provided"],
     }
 
 
@@ -179,6 +245,7 @@ def _normalize_news_context(news_context: list[dict[str, Any]]) -> list[dict[str
         normalized.append(
             {
                 "title": title,
+                "summary": str(article.get("summary") or "").strip()[:2000],
                 "url": url,
                 "source": str(article.get("source") or "News"),
                 "published": str(article.get("published") or ""),
@@ -226,6 +293,7 @@ def _build_key_assumptions(
     days: int,
     calibration_applied: bool,
     model_explanation: str,
+    context_signals: dict[str, Any],
 ) -> str:
     latest_price = float(recent.iloc[-1])
     projected_change = (projected_price / latest_price - 1) * 100
@@ -243,9 +311,38 @@ def _build_key_assumptions(
         f"Latest close was ${latest_price:.2f}. Projects a {abs(projected_change):.1f}% "
         f"{direction} over about {days} calendar days. "
         f"{trend_text} Historical annualized volatility was {annualized_volatility:.1f}%. "
-        f"{model_explanation} This estimate uses price history only; it does not model news, "
-        "fundamentals, or future market events."
+        f"{model_explanation} "
+        "Recent headlines can nudge short-horizon estimates by at most 0.5%; "
+        "reported company fundamentals can adjust long-run growth by at most 1 percentage point annually. "
+        "Known scheduled events widen the range without predicting their outcome. "
+        "These context overlays are bounded heuristics, not validated causal effects."
     )
+    if context_signals["news_articles_used"]:
+        assumptions += (
+            f" Recent headline sentiment was {context_signals['news_sentiment_score']:+.2f} "
+            f"across {context_signals['news_articles_used']} dated article(s)."
+        )
+    if context_signals["fundamental_score"] is not None:
+        assumptions += (
+            f" The fundamentals score was {context_signals['fundamental_score']:+.2f} "
+            f"from {context_signals['fundamental_metrics_used']} reported metric(s)."
+        )
+    elif context_signals["fundamental_metrics_used"]:
+        assumptions += (
+            " Some company metrics were available, but not enough to compute a "
+            "fundamentals signal."
+        )
+    if context_signals["relevant_events"]:
+        event_labels = ", ".join(
+            f"{event['label']} on {event['date']}"
+            for event in context_signals["relevant_events"]
+        )
+        assumptions += f" Upcoming scheduled events: {event_labels}."
+    if (
+        not context_signals["news_articles_used"]
+        and context_signals["fundamental_score"] is None
+    ):
+        assumptions += " No usable news or company fundamentals were available; this is the price-history baseline."
     if calibration_applied:
         assumptions += " Recent forecast-error calibration was applied."
     return assumptions

@@ -14,6 +14,8 @@ const Dashboard: React.FC = () => {
     catalysts,
     predictions,
     forecastNews,
+    forecastMarketContext,
+    forecastContextSignals,
     loading,
     error,
     addAsset,
@@ -278,6 +280,8 @@ const Dashboard: React.FC = () => {
           latestPrice={latestPrice}
           historyCount={selectedHistory.length}
           news={forecastNews[selectedTicker] ?? []}
+          marketContext={forecastMarketContext[selectedTicker] ?? null}
+          contextSignals={forecastContextSignals[selectedTicker] ?? {}}
         />
       )}
 

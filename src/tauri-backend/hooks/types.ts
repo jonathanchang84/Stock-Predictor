@@ -104,8 +104,69 @@ export interface ForecastResult {
   generated_at: string;
   predictions: Record<string, HorizonForecast>;
   news_context: NewsArticle[];
+  market_context: MarketContext;
+  context_signals: Record<string, ForecastContextSignal>;
+  context_snapshot_id: number | null;
   confidence_band: Record<string, number>;
   calibration_context_applied: boolean;
+}
+
+export interface MarketFundamentals {
+  short_name?: string;
+  quote_type?: string;
+  sector?: string;
+  industry?: string;
+  currency?: string;
+  fund_family?: string;
+  category?: string;
+  market_cap?: number;
+  trailing_pe?: number;
+  forward_pe?: number;
+  price_to_book?: number;
+  revenue_growth?: number;
+  earnings_growth?: number;
+  profit_margin?: number;
+  operating_margin?: number;
+  return_on_equity?: number;
+  debt_to_equity?: number;
+  free_cash_flow?: number;
+  dividend_yield?: number;
+  target_mean_price?: number;
+  recommendation_mean?: number;
+  expense_ratio?: number;
+  nav_price?: number;
+  total_assets?: number;
+  ytd_return?: number;
+  three_year_average_return?: number;
+  five_year_average_return?: number;
+  ten_year_average_return?: number;
+}
+
+export interface MarketContextEvent {
+  type: string;
+  date: string;
+  label: string;
+  source: string;
+}
+
+export interface MarketContext {
+  ticker: string;
+  source: string;
+  captured_at: string;
+  fundamentals: MarketFundamentals;
+  upcoming_events: MarketContextEvent[];
+  warnings: string[];
+}
+
+export interface ForecastContextSignal {
+  news_sentiment_score: number;
+  news_articles_used: number;
+  news_adjustment_pct: number;
+  fundamental_score: number | null;
+  fundamental_metrics_used: number;
+  fundamental_annualized_adjustment_pct: number;
+  event_risk_multiplier: number;
+  relevant_events: MarketContextEvent[];
 }
 
 export interface BacktestMetrics {
@@ -122,6 +183,7 @@ export interface ForecastBacktestResult {
   methodology: string;
   horizons: Record<string, {
     sample_size: number;
+    context_sample_size: number;
     model: BacktestMetrics | null;
     baseline: BacktestMetrics | null;
   }>;

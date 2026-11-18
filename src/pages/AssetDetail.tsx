@@ -12,6 +12,8 @@ const AssetDetail: React.FC = () => {
     catalysts,
     predictions,
     forecastNews,
+    forecastMarketContext,
+    forecastContextSignals,
     errorAudits,
     error,
     loading,
@@ -84,6 +86,8 @@ const AssetDetail: React.FC = () => {
           latestPrice={latestPrice}
           historyCount={history.length}
           news={forecastNews[ticker] ?? []}
+          marketContext={forecastMarketContext[ticker] ?? null}
+          contextSignals={forecastContextSignals[ticker] ?? {}}
         />
       )}
 

@@ -2,7 +2,7 @@
 
 import argparse
 import logging
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 
 import uvicorn
 
@@ -17,22 +17,23 @@ def run_daily():
     """Run the full daily pipeline: audit + forecast."""
     from .core import error_auditor, forecast_service
     from .core.prediction_engine import generate_forecast
-    from .services import market_data, news_fetcher
+    from .services import market_context, market_data, news_fetcher
 
     # Ensure SQLite is initialized
     conn = get_connection()
     conn.close()
 
     # Build data sources
-    sources = [
-        market_data.YFinanceSource(),
-        news_fetcher.RSSNewsSource(),
-    ]
-    fetcher = market_data.DataFetcher(sources)
-    news_fetcher_ = news_fetcher.NewsFetcher(sources + [news_fetcher.RSSNewsSource()])
+    fetcher = market_data.DataFetcher([market_data.YFinanceSource()])
+    news_fetcher_ = news_fetcher.NewsFetcher(
+        [
+            news_fetcher.YahooFinanceNewsSource(),
+            news_fetcher.RSSNewsSource(),
+        ]
+    )
 
     # Load assets
-    from ..db.connection import fetch_all
+    from .db.connection import fetch_all
     assets = fetch_all("SELECT ticker, asset_type, name, notes FROM assets")
     if not assets:
         logger.warning("No assets found in the database.")
@@ -42,15 +43,31 @@ def run_daily():
     for asset in assets:
         ticker = asset["ticker"]
         try:
-            # Fetch price history (up to 5 years for CAGR + volatility)
-            df = fetcher.fetch_ohlcv(ticker, start="2019-01-01", end=datetime.now(timezone.utc).strftime("%Y-%m-%d"), interval="1d")
+            # Use the same maximum available history as the API forecast path.
+            today = datetime.now(timezone.utc).date()
+            try:
+                start = today.replace(year=today.year - 99)
+            except ValueError:
+                start = today.replace(year=today.year - 99, day=28)
+            df = fetcher.fetch_ohlcv(
+                ticker,
+                start=start.isoformat(),
+                end=(today + timedelta(days=1)).isoformat(),
+                interval="1d",
+            )
             if df is None or df.empty:
                 logger.warning("No price data for %s", ticker)
                 results.append({"ticker": ticker, "error": "No data"})
                 continue
 
             # Fetch news
-            news = news_fetcher_.search(ticker, from_date="2026-11-01", limit=10)
+            news = news_fetcher_.search(
+                ticker,
+                from_date=(today - timedelta(days=7)).isoformat(),
+                limit=5,
+            )
+            market_context_snapshot = market_context.fetch_market_context(ticker)
+            market_context_snapshot["asset_type"] = asset["asset_type"]
 
             # Load calibration
             cal = forecast_service._load_calibration_context(ticker, "general")
@@ -58,10 +75,21 @@ def run_daily():
             # Generate forecast
             from datetime import datetime as dt
             today = dt.now(timezone.utc).isoformat(timespec="seconds").replace("+00:00", "Z")
-            from ..core.prediction_engine import generate_forecast
-            fc = generate_forecast(ticker, df, news, cal, today)
+            fc = generate_forecast(
+                ticker,
+                df,
+                news,
+                cal,
+                today,
+                market_context=market_context_snapshot,
+            )
 
             # Save prediction ledger
+            fc["context_snapshot_id"] = forecast_service.save_market_context_snapshot(
+                ticker,
+                fc["market_context"],
+                fc["news_context"],
+            )
             forecast_service.save_prediction(fc)
 
             results.append({"ticker": ticker, "forecasts_generated": 9, "horizons": list(fc["predictions"].keys())})

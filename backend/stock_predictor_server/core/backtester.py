@@ -1,6 +1,6 @@
 """Leakage-safe walk-forward evaluation for the current forecast model."""
 
-from datetime import timedelta
+from datetime import date, timedelta
 from typing import Any
 
 import numpy as np
@@ -8,12 +8,15 @@ import pandas as pd
 
 from .prediction_engine import DAYS, HORIZONS, MODEL_VERSION, generate_forecast
 
+MAX_CONTEXT_SNAPSHOT_AGE_DAYS = 90
+
 
 def walk_forward_backtest(
     ticker: str,
     price_history: pd.DataFrame,
     minimum_train_rows: int = 252,
     step_rows: int = 63,
+    context_snapshots: list[dict[str, Any]] | None = None,
 ) -> dict[str, Any]:
     """Evaluate forecasts using only data available at each historical forecast date."""
     data = price_history.copy()
@@ -28,18 +31,44 @@ def walk_forward_backtest(
     if minimum_train_rows < 20 or step_rows < 1:
         raise ValueError("minimum_train_rows must be at least 20 and step_rows must be positive")
 
+    snapshots = sorted(context_snapshots or [], key=lambda row: row["captured_at"])
+    snapshot_index = 0
+    latest_snapshot: dict[str, Any] | None = None
     dates = close.index
     for origin_index in range(minimum_train_rows - 1, len(close), step_rows):
         origin_date = dates[origin_index]
         origin_price = float(close.iloc[origin_index])
         history = data.loc[dates[: origin_index + 1]].copy()
         history["close"] = close.iloc[: origin_index + 1]
+        while snapshot_index < len(snapshots):
+            snapshot_date = _snapshot_date(snapshots[snapshot_index]["captured_at"])
+            if snapshot_date >= origin_date.date():
+                break
+            latest_snapshot = snapshots[snapshot_index]
+            snapshot_index += 1
+
+        snapshot_payload = None
+        if latest_snapshot is not None:
+            snapshot_age = (origin_date.date() - _snapshot_date(latest_snapshot["captured_at"])).days
+            if 0 < snapshot_age <= MAX_CONTEXT_SNAPSHOT_AGE_DAYS:
+                snapshot_payload = latest_snapshot.get("context", {})
+        market_context = (
+            snapshot_payload.get("market_context")
+            if isinstance(snapshot_payload, dict)
+            else None
+        )
+        news_context = (
+            snapshot_payload.get("news_context", [])
+            if isinstance(snapshot_payload, dict)
+            else []
+        )
         forecast = generate_forecast(
             ticker,
             history,
-            [],
+            news_context,
             {},
             origin_date.strftime("%Y-%m-%dT00:00:00Z"),
+            market_context=market_context,
         )
 
         for horizon in HORIZONS:
@@ -63,6 +92,7 @@ def walk_forward_backtest(
                     "baseline": origin_price,
                     "low": float(prediction["low"]),
                     "high": float(prediction["high"]),
+                    "context_used": snapshot_payload is not None,
                 }
             )
 
@@ -72,6 +102,7 @@ def walk_forward_backtest(
         if not count:
             horizon_results[horizon] = {
                 "sample_size": 0,
+                "context_sample_size": 0,
                 "model": None,
                 "baseline": None,
             }
@@ -85,6 +116,7 @@ def walk_forward_backtest(
 
         horizon_results[horizon] = {
             "sample_size": count,
+            "context_sample_size": sum(bool(row["context_used"]) for row in rows),
             "model": {
                 "mae": float(np.mean(np.abs(predicted - actual))),
                 "mape": float(np.mean(np.abs(predicted - actual) / actual) * 100),
@@ -111,7 +143,14 @@ def walk_forward_backtest(
         "methodology": (
             f"Walk-forward, {minimum_train_rows}-row initial history, "
             f"{step_rows}-row step, next available close within 7 calendar days. "
-            "Compared with a flat last-close baseline; no transaction costs."
+            f"Used only context snapshots captured before an origin and no more than "
+            f"{MAX_CONTEXT_SNAPSHOT_AGE_DAYS} days old; "
+            "missing snapshots use the price-history baseline. Compared with a flat last-close baseline; "
+            "no transaction costs."
         ),
         "horizons": horizon_results,
     }
+
+
+def _snapshot_date(captured_at: str) -> date:
+    return pd.Timestamp(captured_at).date()

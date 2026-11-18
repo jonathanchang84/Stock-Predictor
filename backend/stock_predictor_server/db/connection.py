@@ -45,6 +45,9 @@ def initialize_database() -> None:
             "interval_coverage": "REAL NOT NULL DEFAULT 0.9",
             "interval_method": "TEXT NOT NULL DEFAULT 'legacy'",
             "model_version": "TEXT NOT NULL DEFAULT 'legacy'",
+            "context_snapshot_id": (
+                "INTEGER REFERENCES market_context_snapshots(id) ON DELETE SET NULL"
+            ),
         }
         for column, declaration in migrations.items():
             if column not in columns:

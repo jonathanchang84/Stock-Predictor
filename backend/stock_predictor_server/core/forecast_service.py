@@ -1,10 +1,11 @@
 """Forecast service: prediction ledger + calibration injection."""
 
+import json
 import logging
 from datetime import datetime, timezone
 from typing import Any
 
-from ..db.connection import fetch_all, fetch_one, execute
+from ..db.connection import execute, fetch_all, fetch_one, get_connection
 from .prediction_engine import HORIZONS, MODEL_VERSION, generate_forecast
 
 logger = logging.getLogger(__name__)
@@ -34,6 +35,36 @@ def _load_calibration_context(ticker: str, sector: str) -> dict[str, Any]:
     }
 
 
+def save_market_context_snapshot(
+    ticker: str,
+    market_context: dict[str, Any],
+    news_context: list[dict[str, Any]],
+) -> int:
+    """Persist the exact context available to a forecast for later backtesting."""
+    captured_at = datetime.now(timezone.utc).isoformat(timespec="microseconds").replace(
+        "+00:00", "Z"
+    )
+    context_json = json.dumps(
+        {
+            "market_context": market_context,
+            "news_context": news_context,
+        },
+        allow_nan=False,
+        separators=(",", ":"),
+    )
+    conn = get_connection()
+    try:
+        cursor = conn.execute(
+            "INSERT INTO market_context_snapshots (ticker, captured_at, context_json) "
+            "VALUES (?, ?, ?)",
+            (ticker, captured_at, context_json),
+        )
+        conn.commit()
+        return cursor.lastrowid
+    finally:
+        conn.close()
+
+
 def save_prediction(forecast: dict[str, Any]) -> int:
     """Write the prediction ledger for all horizons."""
     if not forecast.get("predictions"):
@@ -53,6 +84,7 @@ def save_prediction(forecast: dict[str, Any]) -> int:
             pred.get("interval_coverage", 0.9),
             pred.get("interval_method", "unavailable"),
             forecast.get("model_version", "legacy"),
+            forecast.get("context_snapshot_id"),
             pred.get("sentiment_score", 0.0),
             pred.get("key_assumptions", ""),
             now,
@@ -61,8 +93,8 @@ def save_prediction(forecast: dict[str, Any]) -> int:
             INSERT OR REPLACE INTO predictions
             (ticker, horizon, prediction_date, predicted_price, confidence_interval,
              low, high, interval_coverage, interval_method, model_version,
-             sentiment_score, key_assumptions, created_at)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+             context_snapshot_id, sentiment_score, key_assumptions, created_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         """
         execute(query, params, fetch=False)
         inserted += 1

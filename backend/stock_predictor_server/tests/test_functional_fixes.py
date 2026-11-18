@@ -12,10 +12,175 @@ from stock_predictor_server.api import main, routes
 from stock_predictor_server.api.routes import _normalize_price_history
 from stock_predictor_server.core.backtester import walk_forward_backtest
 from stock_predictor_server.core import error_auditor, forecast_service
+from stock_predictor_server.core.context_signals import build_context_signals
 from stock_predictor_server.core.prediction_engine import MODEL_VERSION, generate_forecast
 from stock_predictor_server.db import connection
 from stock_predictor_server.services.market_data import YFinanceSource
+from stock_predictor_server.services import market_context as market_context_service
 from stock_predictor_server.services.news_fetcher import RSSNewsSource, YahooFinanceNewsSource
+
+
+class MarketContextTests(unittest.TestCase):
+    def test_normalizes_yahoo_fundamentals_and_only_future_events(self):
+        class FakeTicker:
+            def get_info(self):
+                return {
+                    "shortName": "Example Corp",
+                    "quoteType": "EQUITY",
+                    "sector": "Technology",
+                    "marketCap": 1_000_000_000,
+                    "revenueGrowth": 0.12,
+                    "earningsTimestampStart": int(
+                        datetime(2025, 1, 20, tzinfo=timezone.utc).timestamp()
+                    ),
+                }
+
+            @property
+            def calendar(self):
+                return pd.DataFrame(
+                    {
+                        "Value": [
+                            pd.Timestamp("2025-01-20"),
+                            pd.Timestamp("2024-12-15"),
+                        ]
+                    },
+                    index=["Earnings Date", "Ex-Dividend Date"],
+                )
+
+        with patch("yfinance.Ticker", return_value=FakeTicker()):
+            context = market_context_service._load_market_context(
+                "ACME",
+                datetime(2025, 1, 1, tzinfo=timezone.utc),
+            )
+
+        self.assertEqual(context["fundamentals"]["sector"], "Technology")
+        self.assertEqual(context["fundamentals"]["revenue_growth"], 0.12)
+        self.assertEqual(len(context["upcoming_events"]), 1)
+        self.assertEqual(context["upcoming_events"][0]["type"], "earnings")
+        self.assertEqual(context["upcoming_events"][0]["date"], "2025-01-20")
+
+    def test_dividend_payment_date_is_not_treated_as_ex_dividend_date(self):
+        events = market_context_service._normalize_calendar(
+            pd.DataFrame(
+                {"Value": [pd.Timestamp("2025-02-01")]},
+                index=["Dividend Date"],
+            ),
+            {},
+            datetime(2025, 1, 1).date(),
+        )
+
+        self.assertEqual(events[0]["type"], "dividend")
+        self.assertEqual(events[0]["label"], "Dividend")
+
+    def test_quote_type_only_context_reports_missing_fundamental_metrics(self):
+        class FakeTicker:
+            def get_info(self):
+                return {"quoteType": "ETF"}
+
+            @property
+            def calendar(self):
+                return {}
+
+        with patch("yfinance.Ticker", return_value=FakeTicker()):
+            context = market_context_service._load_market_context(
+                "FUND",
+                datetime(2025, 1, 1, tzinfo=timezone.utc),
+            )
+
+        self.assertEqual(context["fundamentals"]["quote_type"], "ETF")
+        self.assertIn(
+            "Yahoo Finance returned no usable fundamental metrics",
+            context["warnings"],
+        )
+
+    def test_news_fundamentals_and_events_produce_separate_bounded_signals(self):
+        signal = build_context_signals(
+            [
+                {
+                    "title": "Company beats estimates and raises guidance",
+                    "summary": "",
+                    "url": "https://example.test/news",
+                    "published": "2025-04-10T12:00:00Z",
+                },
+                {
+                    "title": "Company misses estimates",
+                    "summary": "",
+                    "url": "https://example.test/old",
+                    "published": "2025-03-20T12:00:00Z",
+                },
+                {
+                    "title": "Future article should not be used",
+                    "summary": "Strong growth",
+                    "url": "https://example.test/future",
+                    "published": "2025-04-11T12:00:00Z",
+                },
+            ],
+            {
+                "fundamentals": {
+                    "quote_type": "EQUITY",
+                    "revenue_growth": 0.2,
+                    "earnings_growth": 0.2,
+                    "profit_margin": 0.2,
+                    "return_on_equity": 0.2,
+                },
+                "upcoming_events": [
+                    {
+                        "type": "earnings",
+                        "date": "2025-04-15",
+                        "label": "Earnings",
+                        "source": "Yahoo Finance",
+                    }
+                ],
+            },
+            365,
+            "2025-04-10T20:00:00Z",
+        )
+
+        self.assertEqual(signal["news_articles_used"], 1)
+        self.assertEqual(signal["news_sentiment_score"], 0.3333)
+        self.assertEqual(signal["news_adjustment_pct"], 0.0)
+        self.assertGreater(signal["fundamental_score"], 0)
+        self.assertGreater(signal["fundamental_annualized_adjustment_pct"], 0)
+        self.assertEqual(signal["event_risk_multiplier"], 1.25)
+
+    def test_fundamental_overlay_does_not_treat_funds_as_companies(self):
+        signal = build_context_signals(
+            [],
+            {
+                "fundamentals": {
+                    "quote_type": "ETF",
+                    "revenue_growth": 0.3,
+                    "earnings_growth": 0.3,
+                    "profit_margin": 0.2,
+                },
+                "upcoming_events": [],
+            },
+            365,
+            "2025-04-10T20:00:00Z",
+        )
+
+        self.assertIsNone(signal["fundamental_score"])
+        self.assertEqual(signal["fundamental_annualized_adjustment_pct"], 0.0)
+
+    def test_tracked_fund_type_overrides_incomplete_provider_quote_type(self):
+        signal = build_context_signals(
+            [],
+            {
+                "asset_type": "index_fund",
+                "fundamentals": {
+                    "quote_type": "EQUITY",
+                    "revenue_growth": 0.3,
+                    "earnings_growth": 0.3,
+                    "profit_margin": 0.2,
+                },
+                "upcoming_events": [],
+            },
+            365,
+            "2025-04-10T20:00:00Z",
+        )
+
+        self.assertIsNone(signal["fundamental_score"])
+        self.assertEqual(signal["fundamental_annualized_adjustment_pct"], 0.0)
 
 
 class PriceHistoryNormalizationTests(unittest.TestCase):
@@ -92,6 +257,75 @@ class PriceHistoryNormalizationTests(unittest.TestCase):
             corrected["predictions"]["7d"]["key_assumptions"],
         )
 
+    def test_forecast_uses_bounded_news_fundamental_and_event_context(self):
+        data = pd.DataFrame(
+            {"close": [100.0 + index * 0.001 for index in range(100)]},
+            index=pd.date_range("2025-01-01", periods=100),
+        )
+        as_of = "2025-04-11T20:00:00Z"
+        news = [
+            {
+                "title": "Company beats estimates and raises guidance",
+                "summary": "",
+                "url": "https://example.test/news",
+                "source": "Example",
+                "published": "2025-04-11T12:00:00Z",
+            }
+        ]
+        context = {
+            "ticker": "ACME",
+            "source": "Yahoo Finance",
+            "captured_at": as_of,
+            "fundamentals": {
+                "quote_type": "EQUITY",
+                "revenue_growth": 0.2,
+                "earnings_growth": 0.2,
+                "profit_margin": 0.2,
+                "return_on_equity": 0.2,
+            },
+            "upcoming_events": [
+                {
+                    "type": "earnings",
+                    "date": "2025-04-18",
+                    "label": "Earnings",
+                    "source": "Yahoo Finance",
+                }
+            ],
+            "warnings": [],
+        }
+
+        baseline = generate_forecast("ACME", data, [], {}, as_of)
+        contextual = generate_forecast("ACME", data, news, {}, as_of, context)
+
+        self.assertGreater(
+            contextual["predictions"]["1d"]["predicted_price"],
+            baseline["predictions"]["1d"]["predicted_price"],
+        )
+        self.assertGreater(
+            contextual["predictions"]["1y"]["predicted_price"],
+            baseline["predictions"]["1y"]["predicted_price"],
+        )
+        self.assertIn(
+            "widened for scheduled-event risk",
+            contextual["predictions"]["1y"]["interval_method"],
+        )
+        self.assertIn(
+            "Recent headline sentiment",
+            contextual["predictions"]["1d"]["key_assumptions"],
+        )
+        self.assertIn(
+            "fundamentals score",
+            contextual["predictions"]["1y"]["key_assumptions"],
+        )
+        self.assertLessEqual(
+            contextual["context_signals"]["1d"]["news_adjustment_pct"],
+            0.5,
+        )
+        self.assertLessEqual(
+            contextual["context_signals"]["1y"]["fundamental_annualized_adjustment_pct"],
+            1.0,
+        )
+
     def test_forecast_returns_only_sourced_http_news_context(self):
         data = pd.DataFrame(
             {"close": [40.0 + index for index in range(25)]},
@@ -115,6 +349,7 @@ class PriceHistoryNormalizationTests(unittest.TestCase):
             [
                 {
                     "title": "Quarterly results",
+                    "summary": "",
                     "url": "https://example.test/results",
                     "source": "Example",
                     "published": "",
@@ -129,8 +364,8 @@ class PriceHistoryNormalizationTests(unittest.TestCase):
         )
         forecast_dates = []
 
-        def fake_forecast(_ticker, history, _news, _calibration, today):
-            forecast_dates.append((history.index[-1], today))
+        def fake_forecast(_ticker, history, _news, _calibration, today, market_context=None):
+            forecast_dates.append((history.index[-1], today, market_context))
             return {
                 "predictions": {
                     horizon: {
@@ -142,13 +377,49 @@ class PriceHistoryNormalizationTests(unittest.TestCase):
                 }
             }
 
+        first_origin = data.index[251]
+        snapshots = [
+            {
+                "captured_at": (first_origin - timedelta(days=45)).strftime("%Y-%m-%dT23:00:00Z"),
+                "context": {
+                    "market_context": {"fundamentals": {"sector": "Technology"}},
+                    "news_context": [],
+                },
+            },
+            {
+                "captured_at": (first_origin + timedelta(days=2)).strftime("%Y-%m-%dT23:00:00Z"),
+                "context": {
+                    "market_context": {"fundamentals": {"sector": "Future"}},
+                    "news_context": [],
+                },
+            },
+        ]
         with patch("stock_predictor_server.core.backtester.generate_forecast", fake_forecast):
-            result = walk_forward_backtest("ACME", data, minimum_train_rows=252, step_rows=63)
+            result = walk_forward_backtest(
+                "ACME",
+                data,
+                minimum_train_rows=252,
+                step_rows=63,
+                context_snapshots=snapshots,
+            )
 
         self.assertGreater(result["horizons"]["1d"]["sample_size"], 0)
         self.assertIsNotNone(result["horizons"]["1d"]["baseline"])
         self.assertEqual(result["horizons"]["20y"]["sample_size"], 0)
-        self.assertTrue(all(history_date.strftime("%Y-%m-%d") == today[:10] for history_date, today in forecast_dates))
+        self.assertTrue(
+            all(
+                history_date.strftime("%Y-%m-%d") == today[:10]
+                for history_date, today, _ in forecast_dates
+            )
+        )
+        self.assertEqual(result["horizons"]["1d"]["context_sample_size"], 2)
+        self.assertEqual(
+            forecast_dates[0][2]["fundamentals"]["sector"],
+            "Technology",
+        )
+        self.assertEqual(forecast_dates[1][2]["fundamentals"]["sector"], "Future")
+        self.assertIsNone(forecast_dates[-1][2])
+        self.assertIn("90 days old", result["methodology"])
 
     def test_backtest_route_evaluates_saved_price_history(self):
         original_path = connection.DB_PATH
@@ -290,7 +561,7 @@ class RSSNewsSourceTests(unittest.TestCase):
 
         self.assertIn("/api/news/search", paths)
         self.assertIn("/api/assets/search", paths)
-        self.assertEqual(main.app.version, "0.1.5")
+        self.assertEqual(main.app.version, "0.1.6")
 
     def test_search_assets_returns_ticker_and_name(self):
         class FakeSearch:
@@ -480,7 +751,12 @@ class DatabaseInitializationTests(unittest.TestCase):
                     "SELECT model_version, interval_coverage, interval_method FROM predictions"
                 )
                 self.assertTrue(
-                    {"model_version", "interval_coverage", "interval_method"} <= columns
+                    {
+                        "model_version",
+                        "interval_coverage",
+                        "interval_method",
+                        "context_snapshot_id",
+                    } <= columns
                 )
                 self.assertEqual(legacy["model_version"], "legacy")
                 self.assertEqual(legacy["interval_method"], "legacy")
@@ -620,13 +896,32 @@ class DatabaseInitializationTests(unittest.TestCase):
                         }
                     ],
                 ):
-                    result = routes.generate_forecast({"ticker": "ACME"})
+                    with patch.object(
+                        routes.market_context_service,
+                        "fetch_market_context",
+                        return_value={
+                            "ticker": "ACME",
+                            "source": "Yahoo Finance",
+                            "captured_at": "2025-01-26T00:00:00Z",
+                            "fundamentals": {"sector": "Technology"},
+                            "upcoming_events": [],
+                            "warnings": [],
+                        },
+                    ):
+                        result = routes.generate_forecast({"ticker": "ACME"})
 
                 self.assertEqual(len(result["predictions"]), 9)
                 self.assertEqual(result["news_context"][0]["title"], "Company update")
+                self.assertIsNotNone(result["context_snapshot_id"])
                 self.assertEqual(
                     connection.fetch_one("SELECT COUNT(*) AS count FROM predictions")["count"],
                     9,
+                )
+                self.assertEqual(
+                    connection.fetch_one(
+                        "SELECT COUNT(*) AS count FROM market_context_snapshots"
+                    )["count"],
+                    1,
                 )
         finally:
             connection.DB_PATH = original_path
@@ -654,14 +949,36 @@ class DatabaseInitializationTests(unittest.TestCase):
 
                 with patch.object(routes, "_fetch_and_store_price_history"):
                     with patch.object(routes, "_search_news_articles", return_value=[]):
-                        with patch.object(error_auditor, "audit_predictions", return_value={"audited": 0}):
-                            with patch.object(routes, "fetch_all", side_effect=tracked_fetch_all):
-                                with patch(
-                                    "stock_predictor_server.core.prediction_engine.generate_forecast",
-                                    return_value={"ticker": "ACME", "predictions": {}},
-                                ):
-                                    with patch.object(forecast_service, "save_prediction"):
-                                        routes.run_daily_forecast()
+                        with patch.object(
+                            routes.market_context_service,
+                            "fetch_market_context",
+                            return_value={
+                                "ticker": "ACME",
+                                "source": "Yahoo Finance",
+                                "captured_at": "2025-01-03T00:00:00Z",
+                                "fundamentals": {},
+                                "upcoming_events": [],
+                                "warnings": [],
+                            },
+                        ):
+                            with patch.object(
+                                forecast_service,
+                                "save_market_context_snapshot",
+                                return_value=1,
+                            ):
+                                with patch.object(error_auditor, "audit_predictions", return_value={"audited": 0}):
+                                    with patch.object(routes, "fetch_all", side_effect=tracked_fetch_all):
+                                        with patch(
+                                            "stock_predictor_server.core.prediction_engine.generate_forecast",
+                                            return_value={
+                                                "ticker": "ACME",
+                                                "predictions": {},
+                                                "market_context": {},
+                                                "news_context": [],
+                                            },
+                                        ):
+                                            with patch.object(forecast_service, "save_prediction"):
+                                                routes.run_daily_forecast()
 
                 price_queries = [
                     query for query in queries if "FROM price_history" in query
@@ -701,6 +1018,18 @@ class DatabaseInitializationTests(unittest.TestCase):
                     "VALUES (?, ?, ?, ?, ?, ?)",
                     (prediction_id, "2025-01-03", 42.0, 1.0, 0.02, 1),
                 )
+                forecast_service.save_market_context_snapshot(
+                    "ACME",
+                    {
+                        "ticker": "ACME",
+                        "source": "Yahoo Finance",
+                        "captured_at": "2025-01-02T00:00:00Z",
+                        "fundamentals": {},
+                        "upcoming_events": [],
+                        "warnings": [],
+                    },
+                    [],
+                )
                 connection.execute(
                     "INSERT INTO forecast_accuracy (ticker, horizon) VALUES (?, ?)",
                     ("ACME", "1d"),
@@ -725,6 +1054,7 @@ class DatabaseInitializationTests(unittest.TestCase):
                     "predictions",
                     "error_audits",
                     "forecast_accuracy",
+                    "market_context_snapshots",
                 ):
                     count = connection.fetch_one(f"SELECT COUNT(*) AS count FROM {table}")["count"]
                     self.assertEqual(count, 0, table)

@@ -53,7 +53,7 @@ const ErrorDashboard: React.FC = () => {
               <div>
                 <h3 className="font-semibold text-surface-800">Historical walk-forward backtest</h3>
                 <p className="text-xs text-surface-500">
-                  Evaluates forecasts made from earlier data against a flat last-close baseline.
+                Evaluates earlier forecasts against a flat last-close baseline. Context is used only when a snapshot existed before that historical date.
                 </p>
               </div>
               <button
@@ -75,6 +75,7 @@ const ErrorDashboard: React.FC = () => {
                       <tr className="border-b border-surface-200 text-left text-surface-500">
                         <th className="py-2">Horizon</th>
                         <th className="py-2">Samples</th>
+                        <th className="py-2">Context samples</th>
                         <th className="py-2">Model MAPE</th>
                         <th className="py-2">Baseline MAPE</th>
                         <th className="py-2">Direction hit rate</th>
@@ -86,6 +87,7 @@ const ErrorDashboard: React.FC = () => {
                         <tr key={horizon} className="border-b border-surface-100">
                           <td className="py-2">{horizon}</td>
                           <td className="py-2">{result.sample_size}</td>
+                          <td className="py-2">{result.context_sample_size}</td>
                           <td className="py-2">{result.model ? `${result.model.mape.toFixed(2)}%` : "—"}</td>
                           <td className="py-2">{result.baseline ? `${result.baseline.mape.toFixed(2)}%` : "—"}</td>
                           <td className="py-2">

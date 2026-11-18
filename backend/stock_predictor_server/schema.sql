@@ -57,6 +57,18 @@ CREATE TABLE IF NOT EXISTS catalyst_events (
 );
 
 -- Prediction ledger: all generated forecasts
+CREATE TABLE IF NOT EXISTS market_context_snapshots (
+    id           INTEGER PRIMARY KEY AUTOINCREMENT,
+    ticker       TEXT NOT NULL,
+    captured_at  TEXT NOT NULL,
+    context_json TEXT NOT NULL,
+    FOREIGN KEY (ticker) REFERENCES assets(ticker) ON DELETE CASCADE,
+    UNIQUE (ticker, captured_at)
+);
+
+CREATE INDEX IF NOT EXISTS idx_market_context_ticker_time
+    ON market_context_snapshots(ticker, captured_at);
+
 CREATE TABLE IF NOT EXISTS predictions (
     id              INTEGER PRIMARY KEY AUTOINCREMENT,
     prediction_date TEXT NOT NULL,
@@ -69,6 +81,7 @@ CREATE TABLE IF NOT EXISTS predictions (
     interval_coverage REAL NOT NULL DEFAULT 0.9,
     interval_method TEXT NOT NULL DEFAULT 'legacy',
     model_version   TEXT NOT NULL DEFAULT 'legacy',
+    context_snapshot_id INTEGER REFERENCES market_context_snapshots(id) ON DELETE SET NULL,
     sentiment_score REAL NOT NULL DEFAULT 0,
     key_assumptions TEXT NOT NULL DEFAULT '',
     created_at      TIMESTAMP DEFAULT CURRENT_TIMESTAMP,

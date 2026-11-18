@@ -1,5 +1,6 @@
 """REST route handlers for forecasts, daily runner, error analytics, and assets."""
 
+import json
 import logging
 import re
 from datetime import datetime, timedelta, timezone
@@ -11,6 +12,7 @@ from ..core import error_auditor, forecast_service
 from ..core.backtester import walk_forward_backtest
 from ..core.prediction_engine import generate_forecast as build_forecast
 from ..db.connection import execute, executemany, fetch_all, fetch_one, get_connection
+from ..services import market_context as market_context_service
 from ..services import market_data, news_fetcher
 
 router = APIRouter(prefix="/api", tags=["core"])
@@ -366,6 +368,10 @@ def generate_forecast(payload: dict[str, Any]):
     else:
         news_context = _search_news_articles(ticker, limit=5)
 
+    market_context = market_context_service.fetch_market_context(ticker)
+    asset = fetch_one("SELECT asset_type FROM assets WHERE ticker = ?", (ticker,))
+    if asset:
+        market_context["asset_type"] = asset["asset_type"]
     calibration = forecast_service._load_calibration_context(ticker, "tech" if "tech" in news_query.lower() else "general")
 
     result = build_forecast(
@@ -374,6 +380,12 @@ def generate_forecast(payload: dict[str, Any]):
         news_context,
         calibration,
         datetime.now(timezone.utc).isoformat(timespec="seconds").replace("+00:00", "Z"),
+        market_context=market_context,
+    )
+    result["context_snapshot_id"] = forecast_service.save_market_context_snapshot(
+        ticker,
+        result["market_context"],
+        result["news_context"],
     )
     forecast_service.save_prediction(result)
 
@@ -392,7 +404,28 @@ def backtest_forecasts(ticker: str):
     )
     if not rows:
         raise HTTPException(status_code=404, detail=f"No price history for {normalized_ticker}")
-    return walk_forward_backtest(normalized_ticker, _price_history_frame(rows))
+    snapshots = []
+    for row in fetch_all(
+        "SELECT captured_at, context_json FROM market_context_snapshots "
+        "WHERE ticker = ? ORDER BY captured_at",
+        (normalized_ticker,),
+    ):
+        try:
+            context = json.loads(row["context_json"])
+        except json.JSONDecodeError as error:
+            logger.warning(
+                "Ignoring invalid market-context snapshot for %s at %s: %s",
+                normalized_ticker,
+                row["captured_at"],
+                error,
+            )
+            continue
+        snapshots.append({"captured_at": row["captured_at"], "context": context})
+    return walk_forward_backtest(
+        normalized_ticker,
+        _price_history_frame(rows),
+        context_snapshots=snapshots,
+    )
 
 
 @router.post("/run-daily-forecast")
@@ -419,10 +452,24 @@ def run_daily_forecast():
             df = _price_history_frame(rows)
 
             news = _search_news_articles(ticker, limit=5)
+            market_context = market_context_service.fetch_market_context(ticker)
+            market_context["asset_type"] = asset["asset_type"]
             cal = forecast_service._load_calibration_context(ticker, "general")
 
             from ..core.prediction_engine import generate_forecast
-            fc = generate_forecast(ticker, df, news, cal, datetime.now(timezone.utc).isoformat(timespec="seconds").replace("+00:00", "Z"))
+            fc = generate_forecast(
+                ticker,
+                df,
+                news,
+                cal,
+                datetime.now(timezone.utc).isoformat(timespec="seconds").replace("+00:00", "Z"),
+                market_context=market_context,
+            )
+            fc["context_snapshot_id"] = forecast_service.save_market_context_snapshot(
+                ticker,
+                fc["market_context"],
+                fc["news_context"],
+            )
             forecast_service.save_prediction(fc)
             results.append({"ticker": ticker, "forecasts_generated": 9})
         except Exception as e:
