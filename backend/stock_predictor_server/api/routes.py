@@ -340,13 +340,13 @@ def generate_forecast(payload: dict[str, Any]):
         raise HTTPException(status_code=400, detail="ticker is required")
 
     rows = fetch_all(
-        "SELECT date, open, high, low, close, volume FROM price_history WHERE ticker = ? ORDER BY date DESC LIMIT 1000",
+        "SELECT date, open, high, low, close, volume FROM price_history WHERE ticker = ? ORDER BY date DESC",
         (ticker,),
     )
     if not rows:
         _fetch_and_store_price_history(ticker)
         rows = fetch_all(
-            "SELECT date, open, high, low, close, volume FROM price_history WHERE ticker = ? ORDER BY date DESC LIMIT 1000",
+            "SELECT date, open, high, low, close, volume FROM price_history WHERE ticker = ? ORDER BY date DESC",
             (ticker,),
         )
     if not rows:
@@ -390,7 +390,7 @@ def run_daily_forecast():
         ticker = asset["ticker"]
         try:
             rows = fetch_all(
-                "SELECT date, open, high, low, close, volume FROM price_history WHERE ticker = ? ORDER BY date DESC LIMIT 2000",
+                "SELECT date, open, high, low, close, volume FROM price_history WHERE ticker = ? ORDER BY date DESC",
                 (ticker,),
             )
             if not rows:

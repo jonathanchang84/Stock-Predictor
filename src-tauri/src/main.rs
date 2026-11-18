@@ -55,7 +55,7 @@ fn backend_is_compatible(port: u16) -> bool {
         return false;
     };
     let paths = &spec["paths"];
-    spec["info"]["version"] == "0.1.3"
+    spec["info"]["version"] == "0.1.4"
         && paths["/api/news/search"].get("get").is_some()
         && paths["/api/assets/search"].get("get").is_some()
         && paths["/api/forecast"].get("post").is_some()

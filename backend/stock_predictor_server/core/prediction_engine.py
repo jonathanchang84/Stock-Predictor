@@ -39,7 +39,7 @@ def generate_forecast(
         df["date"] = pd.to_datetime(df["date"])
         df = df.set_index("date").sort_index()
 
-    close = df["close"]
+    close = pd.to_numeric(df["close"], errors="coerce").dropna()
     recent = close.dropna()
     if recent.empty:
         return _naive_forecast(ticker, today, df)
@@ -53,9 +53,22 @@ def generate_forecast(
         stat_proj = _statistical_project(close, days)
 
         if days <= 180:
-            blend = 0.6 * stat_proj + 0.4 * short_term.get(h, stat_proj)
+            momentum_proj = _momentum_project(recent, days)
+            blend = 0.5 * stat_proj + 0.5 * momentum_proj
+            model_explanation = (
+                "Short horizons blend the full-history daily return with a capped "
+                "recent 20-session momentum estimate."
+            )
         else:
-            blend = 0.7 * stat_proj + 0.3 * long_term.get(h, stat_proj)
+            long_term_proj = _long_term_project(recent.iloc[-1], days, long_term)
+            long_term_weight = float(np.interp(days, [181, DAYS["20y"]], [0.5, 0.85]))
+            blend = (1 - long_term_weight) * stat_proj + long_term_weight * long_term_proj
+            model_explanation = (
+                f"Long horizons blend historical daily returns with a long-run annual "
+                f"growth estimate of {long_term['cagr_20yr'] * 100:.1f}%, shrunk toward "
+                f"a {long_term['baseline_cagr'] * 100:.1f}% nominal baseline, with the "
+                "projection capped at -8% to +12% annualized."
+            )
 
         if calibration_context:
             bias = calibration_context.get("bias_correction", 0.0)
@@ -63,6 +76,17 @@ def generate_forecast(
             if temper_bullish:
                 blend = blend * 0.85
             blend += bias
+
+        if days > 180:
+            years = days / 365.25
+            latest_price = float(recent.iloc[-1])
+            blend = float(
+                np.clip(
+                    blend,
+                    latest_price * (1 - 0.08) ** years,
+                    latest_price * (1 + 0.12) ** years,
+                )
+            )
 
         predictions[h] = {
             "predicted_price": round(max(blend, 0.01), 2),
@@ -76,6 +100,7 @@ def generate_forecast(
                 blend,
                 days,
                 bool(calibration_context),
+                model_explanation,
             ),
         }
 
@@ -122,6 +147,7 @@ def _build_key_assumptions(
     projected_price: float,
     days: int,
     calibration_applied: bool,
+    model_explanation: str,
 ) -> str:
     latest_price = float(recent.iloc[-1])
     projected_change = (projected_price / latest_price - 1) * 100
@@ -139,7 +165,7 @@ def _build_key_assumptions(
         f"Latest close was ${latest_price:.2f}. Projects a {abs(projected_change):.1f}% "
         f"{direction} over about {days} calendar days. "
         f"{trend_text} Historical annualized volatility was {annualized_volatility:.1f}%. "
-        "The estimate extrapolates price returns and volatility only; it does not model news, "
+        f"{model_explanation} This estimate uses price history only; it does not model news, "
         "fundamentals, or future market events."
     )
     if calibration_applied:
@@ -152,8 +178,10 @@ def _statistical_short_term_forecast(close: pd.Series, recent: pd.Series) -> dic
         return {"sentiment_score": 0.0, "momentum": 0.0, "volatility": 0.0}
 
     rets = np.log(recent / recent.shift(1)).dropna()
-    mom_5d = (recent.iloc[-1] / recent.iloc[-6] - 1) if len(recent) >= 6 else 0.0
-    mom_20d = (recent.iloc[-1] / recent.iloc[-21] - 1) if len(recent) >= 21 else 0.0
+    lookback_5d = min(5, len(recent) - 1)
+    lookback_20d = min(20, len(recent) - 1)
+    mom_5d = recent.iloc[-1] / recent.iloc[-1 - lookback_5d] - 1
+    mom_20d = recent.iloc[-1] / recent.iloc[-1 - lookback_20d] - 1
 
     sentiment = 0.0
     if mom_5d > 0.02:
@@ -172,15 +200,40 @@ def _statistical_short_term_forecast(close: pd.Series, recent: pd.Series) -> dic
 
 def _statistical_long_term_forecast(close: pd.Series, recent: pd.Series) -> dict[str, Any]:
     if len(close) < 20:
-        return {"cagr_20yr": 0.06, "projection": 1.0}
+        return {"cagr_20yr": 0.065, "baseline_cagr": 0.065, "observed_cagr": 0.0}
 
     years = (close.index[-1] - close.index[0]).days / 365.25
-    if years < 0.5:
-        years = 0.5
+    if years <= 0 or close.iloc[0] <= 0 or close.iloc[-1] <= 0:
+        return {"cagr_20yr": 0.065, "baseline_cagr": 0.065, "observed_cagr": 0.0}
     cagr = (close.iloc[-1] / close.iloc[0]) ** (1 / years) - 1
-    cagr_20yr = float(np.clip(cagr * 0.7 + 0.065, 0.02, 0.15))
+    history_weight = min(0.5, years / (years + 10))
+    baseline_cagr = 0.065
+    cagr_20yr = float(np.clip(cagr * history_weight + baseline_cagr * (1 - history_weight), -0.08, 0.12))
 
-    return {"cagr_approx": round(cagr, 4), "cagr_20yr": round(cagr_20yr, 4), "years": years}
+    return {
+        "cagr_approx": round(cagr, 4),
+        "cagr_20yr": round(cagr_20yr, 4),
+        "baseline_cagr": baseline_cagr,
+        "observed_cagr": round(cagr, 4),
+        "years": years,
+    }
+
+
+def _momentum_project(recent: pd.Series, days: int) -> float:
+    returns = np.log(recent / recent.shift(1)).dropna()
+    if returns.empty:
+        return float(recent.iloc[-1])
+
+    recent_drift = returns.tail(20).mean()
+    historical_drift = returns.mean()
+    daily_drift = float(np.clip(0.7 * recent_drift + 0.3 * historical_drift, -0.015, 0.015))
+    trading_days = max(days * 252 / 365.25, 1)
+    return float(recent.iloc[-1] * np.exp(daily_drift * trading_days))
+
+
+def _long_term_project(latest_price: float, days: int, long_term: dict[str, Any]) -> float:
+    years = days / 365.25
+    return float(latest_price * (1 + long_term["cagr_20yr"]) ** years)
 
 
 def _statistical_project(close: pd.Series, days: int) -> float:
@@ -188,7 +241,7 @@ def _statistical_project(close: pd.Series, days: int) -> float:
         return float(close.iloc[-1])
     rets = np.log(close / close.shift(1)).dropna()
     drift = rets.mean()
-    vol = rets.std()
     last = close.iloc[-1]
-    proj = last * np.exp((drift - 0.5 * vol**2) * days / 252 + vol * np.sqrt(days / 252) * 0.4)
+    trading_days = max(days * 252 / 365.25, 1)
+    proj = last * np.exp(drift * trading_days)
     return float(proj)

@@ -28,6 +28,28 @@ class PriceHistoryNormalizationTests(unittest.TestCase):
         self.assertIn("annualized volatility was", forecast["predictions"]["1d"]["key_assumptions"])
         self.assertIn("close was", forecast["predictions"]["1d"]["key_assumptions"])
 
+    def test_forecast_uses_distinct_short_and_long_horizon_models(self):
+        closes = [100.0 + index * 0.1 for index in range(1500)]
+        data = pd.DataFrame(
+            {"close": closes},
+            index=pd.bdate_range("2018-01-01", periods=len(closes)),
+        )
+
+        forecast = generate_forecast("ACME", data, [], {}, "2025-01-01T00:00:00Z")
+        predictions = forecast["predictions"]
+
+        self.assertGreater(
+            predictions["20y"]["predicted_price"],
+            predictions["1d"]["predicted_price"] * 2,
+        )
+        self.assertIn("recent 20-session momentum", predictions["1m"]["key_assumptions"])
+        self.assertIn("nominal baseline", predictions["20y"]["key_assumptions"])
+        self.assertIn("capped at -8% to +12%", predictions["20y"]["key_assumptions"])
+        annualized_20y_change = (
+            (predictions["20y"]["predicted_price"] / closes[-1]) ** (365.25 / 7300) - 1
+        )
+        self.assertLessEqual(annualized_20y_change, 0.1201)
+
     def test_short_history_forecast_uses_latest_close_not_fixed_price(self):
         data = pd.DataFrame(
             {"close": [42.75]},
@@ -124,7 +146,7 @@ class RSSNewsSourceTests(unittest.TestCase):
 
         self.assertIn("/api/news/search", paths)
         self.assertIn("/api/assets/search", paths)
-        self.assertEqual(main.app.version, "0.1.3")
+        self.assertEqual(main.app.version, "0.1.4")
 
     def test_search_assets_returns_ticker_and_name(self):
         class FakeSearch:
@@ -342,6 +364,46 @@ class DatabaseInitializationTests(unittest.TestCase):
                     connection.fetch_one("SELECT COUNT(*) AS count FROM predictions")["count"],
                     9,
                 )
+        finally:
+            connection.DB_PATH = original_path
+
+    def test_daily_forecast_queries_all_stored_price_history(self):
+        original_path = connection.DB_PATH
+        try:
+            with tempfile.TemporaryDirectory() as directory:
+                connection.DB_PATH = Path(directory) / "daily-forecast.db"
+                connection.initialize_database()
+                connection.execute(
+                    "INSERT INTO assets (ticker, asset_type, name, date_added) VALUES (?, ?, ?, ?)",
+                    ("ACME", "stock", "Example", "2025-01-01"),
+                )
+                connection.execute(
+                    "INSERT INTO price_history (ticker, date, close) VALUES (?, ?, ?)",
+                    ("ACME", "2025-01-02", 42.0),
+                )
+                original_fetch_all = routes.fetch_all
+                queries = []
+
+                def tracked_fetch_all(query, *args, **kwargs):
+                    queries.append(query)
+                    if "FROM error_audits JOIN predictions" in query:
+                        return []
+                    return original_fetch_all(query, *args, **kwargs)
+
+                with patch.object(error_auditor, "audit_predictions", return_value={"audited": 0}):
+                    with patch.object(routes, "fetch_all", side_effect=tracked_fetch_all):
+                        with patch(
+                            "stock_predictor_server.core.prediction_engine.generate_forecast",
+                            return_value={"ticker": "ACME", "predictions": {}},
+                        ):
+                            with patch.object(forecast_service, "save_prediction"):
+                                routes.run_daily_forecast()
+
+                price_queries = [
+                    query for query in queries if "FROM price_history" in query
+                ]
+                self.assertEqual(len(price_queries), 1)
+                self.assertNotIn("LIMIT", price_queries[0].upper())
         finally:
             connection.DB_PATH = original_path
 

@@ -1,7 +1,7 @@
 {
   "name": "stock-predictor",
   "private": true,
-  "version": "0.1.3",
+  "version": "0.1.4",
   "description": "Cross-platform stock & fund tracking desktop app with AI forecasting, event correlation, and self-learning feedback loop.",
   "type": "module",
   "scripts": {
@@ -14,6 +14,7 @@
   },
   "dependencies": {
     "@tauri-apps/api": "^2.12.5",
+    "@tauri-apps/plugin-opener": "^2.7.3",
     "@types/react-router-dom": "^5.3.3",
     "react": "^18.3.1",
     "react-dom": "^18.3.1",
