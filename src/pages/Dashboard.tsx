@@ -1,7 +1,8 @@
 import React from "react";
-import { LineChart, Line, XAxis, YAxis, CartesianGrid, Tooltip, ResponsiveContainer } from "recharts";
 import { useTauri } from "../tauri-backend/hooks";
 import type { Asset, AssetSearchResult } from "../tauri-backend/hooks/types";
+import AssetPriceChart from "../components/AssetPriceChart";
+import ForecastSummary from "../components/ForecastSummary";
 
 const TICKER_PATTERN = /^[A-Z0-9.^=_-]+$/i;
 
@@ -9,6 +10,7 @@ const Dashboard: React.FC = () => {
   const {
     assets,
     priceHistory,
+    errorAudits,
     catalysts,
     predictions,
     loading,
@@ -19,6 +21,7 @@ const Dashboard: React.FC = () => {
     searchAssets,
     fetchForecast,
     fetchPriceHistory,
+    fetchErrorAudits,
   } = useTauri();
   const [selectedTicker, setSelectedTicker] = React.useState<string | null>(null);
   const [isAddAssetOpen, setIsAddAssetOpen] = React.useState(false);
@@ -32,6 +35,7 @@ const Dashboard: React.FC = () => {
   const [editType, setEditType] = React.useState("stock");
   const [editNotes, setEditNotes] = React.useState("");
   const [editError, setEditError] = React.useState<string | null>(null);
+  const [assetActionError, setAssetActionError] = React.useState<string | null>(null);
 
   React.useEffect(() => {
     if (assets.length === 0) {
@@ -46,8 +50,9 @@ const Dashboard: React.FC = () => {
   React.useEffect(() => {
     if (selectedTicker) {
       void fetchPriceHistory(selectedTicker);
+      void fetchErrorAudits(selectedTicker);
     }
-  }, [selectedTicker, fetchPriceHistory]);
+  }, [selectedTicker, fetchErrorAudits, fetchPriceHistory]);
 
   const selectedHistory = selectedTicker ? priceHistory[selectedTicker] ?? [] : [];
   const latestPrice = selectedHistory.length ? selectedHistory[selectedHistory.length - 1].close : undefined;
@@ -139,7 +144,10 @@ const Dashboard: React.FC = () => {
     if (!window.confirm(`Stop tracking ${asset.name || asset.ticker}? Its saved history and forecasts will be deleted.`)) {
       return;
     }
-    await deleteAsset(asset.ticker);
+    setAssetActionError(null);
+    if (!await deleteAsset(asset.ticker)) {
+      setAssetActionError("Could not delete the asset. Review the API error shown on this page and try again.");
+    }
   };
 
   const selectSearchResult = (result: AssetSearchResult) => {
@@ -222,6 +230,7 @@ const Dashboard: React.FC = () => {
       {assets.length > 0 && (
         <div className="bg-surface-50 border border-surface-200 rounded-xl p-4">
           <h2 className="text-lg font-semibold text-surface-800 mb-3">Manage tracked assets</h2>
+          {assetActionError && <p role="alert" className="mb-2 text-sm text-red-600">{assetActionError}</p>}
           <div className="divide-y divide-surface-200">
             {assets.map((asset) => (
               <div key={asset.ticker} className="flex flex-col gap-3 py-3 sm:flex-row sm:items-center sm:justify-between">
@@ -252,38 +261,22 @@ const Dashboard: React.FC = () => {
         </div>
       )}
 
-      {selectedTicker && selectedHistory.length > 0 && (
-        <div className="bg-surface-50 border border-surface-200 rounded-xl p-4">
-          <h2 className="text-lg font-semibold text-surface-800 mb-4">Full Price History - {selectedTicker}</h2>
-          <ResponsiveContainer width="100%" height={300}>
-            <LineChart data={selectedHistory}>
-              <CartesianGrid strokeDasharray="3 3" stroke="#e2e8f0" />
-              <XAxis dataKey="date" interval="preserveStartEnd" tickFormatter={(date: string) => new Date(date).toLocaleDateString()} />
-              <YAxis tickFormatter={(value: number) => "$" + value.toFixed(2)} />
-              <Tooltip formatter={(value: number) => [value, "Price"]} />
-              <Line type="monotone" dataKey="close" stroke="#6366f1" strokeWidth={2} dot={false} />
-            </LineChart>
-          </ResponsiveContainer>
-        </div>
+      {selectedTicker && (
+        <AssetPriceChart
+          ticker={selectedTicker}
+          history={selectedHistory}
+          forecast={predictions[selectedTicker]}
+          audits={errorAudits[selectedTicker]}
+        />
       )}
 
       {selectedTicker && predictions[selectedTicker] && (
-        <div className="bg-surface-50 border border-surface-200 rounded-xl p-4">
-          <h2 className="text-lg font-semibold text-surface-800 mb-4">Forecast - {selectedTicker}</h2>
-          {selectedHistory.length < 20 && (
-            <p className="mb-3 text-sm text-amber-700">
-              Limited history: these values use a flat baseline at the latest available close.
-            </p>
-          )}
-          <div className="grid grid-cols-2 sm:grid-cols-3 lg:grid-cols-5 gap-3">
-            {Object.entries(predictions[selectedTicker]).map(([horizon, prediction]) => (
-              <div key={horizon} className="rounded-lg bg-surface-100 p-3">
-                <div className="text-sm text-surface-500">{horizon}</div>
-                <div className="font-semibold text-surface-800">${prediction.predicted_price.toFixed(2)}</div>
-              </div>
-            ))}
-          </div>
-        </div>
+        <ForecastSummary
+          ticker={selectedTicker}
+          forecasts={predictions[selectedTicker]}
+          latestPrice={latestPrice}
+          historyCount={selectedHistory.length}
+        />
       )}
 
       {selectedTicker && catalysts[selectedTicker]?.length > 0 && (

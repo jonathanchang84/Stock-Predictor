@@ -1,7 +1,8 @@
 import React from "react";
 import { Link, useParams } from "react-router-dom";
-import { LineChart, Line, XAxis, YAxis, CartesianGrid, Tooltip, ResponsiveContainer } from "recharts";
 import { useTauri } from "../tauri-backend/hooks";
+import AssetPriceChart from "../components/AssetPriceChart";
+import ForecastSummary from "../components/ForecastSummary";
 
 const AssetDetail: React.FC = () => {
   const { ticker } = useParams<{ ticker: string }>();
@@ -10,11 +11,13 @@ const AssetDetail: React.FC = () => {
     priceHistory,
     catalysts,
     predictions,
+    errorAudits,
     error,
     loading,
     fetchPriceHistory,
     fetchCatalysts,
     fetchForecast,
+    fetchErrorAudits,
   } = useTauri();
 
   React.useEffect(() => {
@@ -22,14 +25,14 @@ const AssetDetail: React.FC = () => {
       void fetchPriceHistory(ticker);
       void fetchCatalysts(ticker);
       void fetchForecast(ticker);
+      void fetchErrorAudits(ticker);
     }
-  }, [ticker, fetchPriceHistory, fetchCatalysts, fetchForecast]);
+  }, [ticker, fetchPriceHistory, fetchCatalysts, fetchForecast, fetchErrorAudits]);
 
   const asset = ticker ? assets.find((item) => item.ticker === ticker) : undefined;
   const history = ticker ? priceHistory[ticker] ?? [] : [];
   const forecast = ticker ? predictions[ticker] : undefined;
   const latestPrice = history.length ? history[history.length - 1].close : undefined;
-  const formatDate = (date: string) => new Date(date).toLocaleDateString();
 
   if (!ticker) return <div className="text-surface-500">No asset selected</div>;
 
@@ -66,43 +69,20 @@ const AssetDetail: React.FC = () => {
         {asset?.notes && <p className="mt-3 text-sm text-surface-600">{asset.notes}</p>}
       </div>
 
-      {history.length > 0 && (
-        <div className="bg-surface-50 border border-surface-200 rounded-xl p-4">
-          <h2 className="text-lg font-semibold text-surface-800 mb-4">Full Price History</h2>
-          <ResponsiveContainer width="100%" height={300}>
-            <LineChart data={history}>
-              <CartesianGrid strokeDasharray="3 3" stroke="#e2e8f0" />
-              <XAxis dataKey="date" interval="preserveStartEnd" tickFormatter={formatDate} />
-              <YAxis tickFormatter={(value: number) => "$" + value.toFixed(2)} />
-              <Tooltip formatter={(value: number) => [value, "Price"]} />
-              <Line type="monotone" dataKey="close" stroke="#6366f1" strokeWidth={2} dot={false} />
-            </LineChart>
-          </ResponsiveContainer>
-        </div>
-      )}
+      <AssetPriceChart
+        ticker={ticker}
+        history={history}
+        forecast={forecast}
+        audits={errorAudits[ticker] ?? []}
+      />
 
       {forecast && Object.keys(forecast).length > 0 && (
-        <div className="bg-surface-50 border border-surface-200 rounded-xl p-4">
-          <h2 className="text-lg font-semibold text-surface-800 mb-4">Multi-Horizon Forecast</h2>
-          {history.length < 20 && (
-            <p className="mb-3 text-sm text-amber-700">
-              Limited history: these values use a flat baseline at the latest available close.
-            </p>
-          )}
-          <div className="grid grid-cols-2 sm:grid-cols-3 lg:grid-cols-5 gap-3">
-            {Object.entries(forecast).map(([horizon, data]) => (
-              <div key={horizon} className="bg-surface-100 rounded-lg p-3">
-                <div className="text-xs text-surface-500">{horizon}</div>
-                <div className="text-lg font-bold text-surface-800">${data.predicted_price.toFixed(2)}</div>
-                {latestPrice !== undefined && (
-                  <div className="text-xs text-surface-500">
-                    Change: {((data.predicted_price / latestPrice - 1) * 100).toFixed(1)}%
-                  </div>
-                )}
-              </div>
-            ))}
-          </div>
-        </div>
+        <ForecastSummary
+          ticker={ticker}
+          forecasts={forecast}
+          latestPrice={latestPrice}
+          historyCount={history.length}
+        />
       )}
 
       {ticker && catalysts[ticker] && catalysts[ticker].length > 0 && (

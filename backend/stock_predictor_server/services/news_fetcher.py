@@ -2,6 +2,7 @@
 
 import logging
 from abc import ABC, abstractmethod
+from datetime import datetime, timezone
 from typing import Any, Optional
 
 logger = logging.getLogger(__name__)
@@ -81,6 +82,42 @@ class MarketauxNewsSource(NewsSource):
             return []
 
 
+class YahooFinanceNewsSource(NewsSource):
+    """Yahoo Finance query search, which does not require an API key."""
+
+    def search(self, query: str, from_date: Optional[str] = None, to_date: Optional[str] = None,
+               limit: int = 20) -> list[dict[str, Any]]:
+        try:
+            import yfinance as yf
+
+            results = yf.Search(
+                query,
+                max_results=0,
+                news_count=min(max(limit, 1), 20),
+                lists_count=0,
+                timeout=15,
+            ).news or []
+        except Exception as error:
+            logger.warning("Yahoo Finance news search failed for %r: %s", query, error)
+            return []
+
+        articles = []
+        for item in results:
+            published = item.get("providerPublishTime")
+            if isinstance(published, (int, float)):
+                published = datetime.fromtimestamp(published, timezone.utc).isoformat()
+            articles.append(
+                {
+                    "source": item.get("publisher") or "Yahoo Finance",
+                    "title": item.get("title") or "",
+                    "summary": item.get("summary") or "",
+                    "url": item.get("link") or "",
+                    "published": published or "",
+                }
+            )
+        return articles[:limit]
+
+
 class RSSNewsSource(NewsSource):
     """RSS feed aggregator (zero-key fallback)."""
 
@@ -107,28 +144,39 @@ class RSSNewsSource(NewsSource):
 
     def search(self, query: str, from_date: Optional[str] = None, to_date: Optional[str] = None,
                limit: int = 20) -> list[dict[str, Any]]:
-        if self._feedparser is None:
-            logger.warning("feedparser not installed; RSS source unavailable")
+        if self._feedparser is None or self._session is None:
+            logger.warning("RSS dependencies are unavailable; RSS source skipped")
             return []
+
+        import requests
 
         limit = max(1, limit)
         results = []
-        try:
-            for url in self.feeds:
+        query_feed = requests.Request(
+            "GET",
+            "https://news.google.com/rss/search",
+            params={"q": query, "hl": "en-US", "gl": "US", "ceid": "US:en"},
+        ).prepare().url
+        for url in [query_feed, *self.feeds]:
+            try:
                 resp = self._session.get(url, timeout=10) if self._session else None
                 if resp is None:
                     continue
-                feed = self._feedparser.parse(resp.content.decode("utf-8", errors="ignore"))
+                resp.raise_for_status()
+                feed = self._feedparser.parse(resp.content)
                 for entry in feed.get("entries", []):
                     title = entry.get("title", "")
                     link = entry.get("link", "")
                     summary = entry.get("summary", "") or entry.get("description", "")
                     published = entry.get("published", "")
-                    if query and query.lower() not in f"{title} {summary}".lower():
+                    if url != query_feed and query and query.casefold() not in f"{title} {summary}".casefold():
                         continue
+                    source_info = entry.get("source") or {}
+                    source_name = source_info.get("title") if isinstance(source_info, dict) else str(source_info)
                     results.append(
                         {
-                            "source": "rss_" + url.split("//")[-1].split("/")[0],
+                            "source": source_name
+                                      or ("Google News" if url == query_feed else url.split("//")[-1].split("/")[0]),
                             "title": title,
                             "url": link,
                             "summary": summary,
@@ -137,8 +185,8 @@ class RSSNewsSource(NewsSource):
                     )
                     if len(results) >= limit:
                         return results
-        except Exception as e:
-            logger.warning("RSS search error: %s", e)
+            except Exception as error:
+                logger.warning("RSS feed %s failed: %s", url, error)
         return results
 
 class NewsFetcher:

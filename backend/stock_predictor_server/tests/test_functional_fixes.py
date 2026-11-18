@@ -9,10 +9,10 @@ from fastapi import HTTPException
 
 from stock_predictor_server.api import main, routes
 from stock_predictor_server.api.routes import _normalize_price_history
-from stock_predictor_server.core import forecast_service
+from stock_predictor_server.core import error_auditor, forecast_service
 from stock_predictor_server.core.prediction_engine import generate_forecast
 from stock_predictor_server.db import connection
-from stock_predictor_server.services.news_fetcher import RSSNewsSource
+from stock_predictor_server.services.news_fetcher import RSSNewsSource, YahooFinanceNewsSource
 
 
 class PriceHistoryNormalizationTests(unittest.TestCase):
@@ -25,7 +25,8 @@ class PriceHistoryNormalizationTests(unittest.TestCase):
         forecast = generate_forecast("ACME", data, [], {}, "2025-01-26T00:00:00Z")
 
         self.assertEqual(len(forecast["predictions"]), 9)
-        self.assertIn("historical price trends", forecast["predictions"]["1d"]["key_assumptions"])
+        self.assertIn("annualized volatility was", forecast["predictions"]["1d"]["key_assumptions"])
+        self.assertIn("close was", forecast["predictions"]["1d"]["key_assumptions"])
 
     def test_short_history_forecast_uses_latest_close_not_fixed_price(self):
         data = pd.DataFrame(
@@ -123,6 +124,7 @@ class RSSNewsSourceTests(unittest.TestCase):
 
         self.assertIn("/api/news/search", paths)
         self.assertIn("/api/assets/search", paths)
+        self.assertEqual(main.app.version, "0.1.3")
 
     def test_search_assets_returns_ticker_and_name(self):
         class FakeSearch:
@@ -168,8 +170,14 @@ class RSSNewsSourceTests(unittest.TestCase):
         class FakeResponse:
             content = b"<rss />"
 
+            def raise_for_status(self):
+                pass
+
         class FakeSession:
+            urls = []
+
             def get(self, _url, timeout):
+                self.urls.append(_url)
                 return FakeResponse()
 
         class FakeFeedParser:
@@ -194,6 +202,27 @@ class RSSNewsSourceTests(unittest.TestCase):
 
         self.assertEqual(len(results), 1)
         self.assertEqual(results[0]["title"], "Chip makers rally")
+        self.assertTrue(any("news.google.com/rss/search" in url for url in FakeSession.urls))
+
+    def test_yahoo_finance_news_source_maps_search_results(self):
+        class FakeSearch:
+            def __init__(self, _query, **_kwargs):
+                self.news = [
+                    {
+                        "title": "Markets move",
+                        "publisher": "Example News",
+                        "link": "https://example.test/markets",
+                        "providerPublishTime": 1735776000,
+                    }
+                ]
+
+        with patch("yfinance.Search", FakeSearch):
+            articles = YahooFinanceNewsSource().search("markets", limit=1)
+
+        self.assertEqual(len(articles), 1)
+        self.assertEqual(articles[0]["source"], "Example News")
+        self.assertEqual(articles[0]["title"], "Markets move")
+        self.assertTrue(articles[0]["published"].startswith("2025-01-02"))
 
     def test_news_route_normalizes_article_fields(self):
         class FakeNewsSource:
@@ -210,10 +239,15 @@ class RSSNewsSourceTests(unittest.TestCase):
         with patch.object(routes, "fetch_all", return_value=[]):
             with patch.object(
                 routes.news_fetcher,
-                "RSSNewsSource",
+                "YahooFinanceNewsSource",
                 return_value=FakeNewsSource(),
             ):
-                articles = routes.search_news("markets")
+                with patch.object(
+                    routes.news_fetcher,
+                        "RSSNewsSource",
+                        return_value=FakeNewsSource(),
+                    ):
+                    articles = routes.search_news("markets")
 
         self.assertEqual(
             articles,
@@ -325,6 +359,11 @@ class DatabaseInitializationTests(unittest.TestCase):
                     "INSERT INTO price_history (ticker, date, close) VALUES (?, ?, ?)",
                     ("ACME", "2025-01-02", 42.0),
                 )
+                connection.execute(
+                    "INSERT INTO catalyst_events (ticker, event_date, event_type, title) "
+                    "VALUES (?, ?, ?, ?)",
+                    ("ACME", "2025-01-02", "news", "Example event"),
+                )
                 prediction_id = connection.execute(
                     "INSERT INTO predictions (ticker, horizon, prediction_date, predicted_price) "
                     "VALUES (?, ?, ?, ?)",
@@ -353,8 +392,51 @@ class DatabaseInitializationTests(unittest.TestCase):
 
                 routes.delete_asset("ACME")
 
-                for table in ("assets", "price_history", "predictions", "error_audits", "forecast_accuracy"):
+                for table in (
+                    "assets",
+                    "price_history",
+                    "catalyst_events",
+                    "predictions",
+                    "error_audits",
+                    "forecast_accuracy",
+                ):
                     count = connection.fetch_one(f"SELECT COUNT(*) AS count FROM {table}")["count"]
                     self.assertEqual(count, 0, table)
+        finally:
+            connection.DB_PATH = original_path
+
+    def test_forecast_audit_uses_horizon_and_records_actual_deviation(self):
+        original_path = connection.DB_PATH
+        try:
+            with tempfile.TemporaryDirectory() as directory:
+                connection.DB_PATH = Path(directory) / "forecast-audit.db"
+                connection.initialize_database()
+                connection.execute(
+                    "INSERT INTO assets (ticker, asset_type, name, date_added) VALUES (?, ?, ?, ?)",
+                    ("ACME", "stock", "Example", "2025-01-01"),
+                )
+                connection.execute(
+                    "INSERT INTO price_history (ticker, date, close) VALUES (?, ?, ?)",
+                    ("ACME", "2025-01-01", 100.0),
+                )
+                connection.execute(
+                    "INSERT INTO price_history (ticker, date, close) VALUES (?, ?, ?)",
+                    ("ACME", "2025-01-03", 108.0),
+                )
+                connection.execute(
+                    "INSERT INTO predictions (ticker, horizon, prediction_date, predicted_price) "
+                    "VALUES (?, ?, ?, ?)",
+                    ("ACME", "1d", "2025-01-01T00:00:00Z", 110.0),
+                )
+
+                result = error_auditor.audit_predictions("ACME")
+                audit = connection.fetch_one(
+                    "SELECT audit_date, actual_close, percentage_error FROM error_audits"
+                )
+
+                self.assertEqual(result["audited"], 1)
+                self.assertEqual(audit["audit_date"], "2025-01-03")
+                self.assertEqual(audit["actual_close"], 108.0)
+                self.assertEqual(audit["percentage_error"], round(2 / 108 * 100, 4))
         finally:
             connection.DB_PATH = original_path

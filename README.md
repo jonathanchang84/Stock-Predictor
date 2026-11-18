@@ -23,6 +23,11 @@ available for that symbol; coverage varies by fund and exchange. Searching
 deleted from the market overview; deleting an asset also removes its saved
 price history and forecasts.
 
+Price charts can be filtered from one day through maximum history. Forecasts
+are plotted separately from actual closes; completed forecast audits show the
+percentage deviation from the realized close. Forecast explanations describe
+the recent price trend and historical volatility used by the model.
+
 ```sh
 npm ci
 npm run tauri:build

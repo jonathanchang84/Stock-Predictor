@@ -273,10 +273,14 @@ export const TauriProvider: React.FC<{ children: React.ReactNode }> = ({ childre
       const priceHistory = { ...current.priceHistory };
       const catalysts = { ...current.catalysts };
       const predictions = { ...current.predictions };
+      const errorAudits = { ...current.errorAudits };
+      const forecastAccuracy = { ...current.forecastAccuracy };
       delete priceHistory[ticker];
       delete catalysts[ticker];
       delete predictions[ticker];
-      return { ...current, assets, priceHistory, catalysts, predictions };
+      delete errorAudits[ticker];
+      delete forecastAccuracy[ticker];
+      return { ...current, assets, priceHistory, catalysts, predictions, errorAudits, forecastAccuracy };
     });
     return true;
   }, [runRequest]);

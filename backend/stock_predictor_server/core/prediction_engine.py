@@ -71,7 +71,12 @@ def generate_forecast(
             "sentiment_score": short_term.get("sentiment_score", 0.0),
             "horizon": h,
             "prediction_date": today,
-            "key_assumptions": _build_key_assumptions(bool(calibration_context)),
+            "key_assumptions": _build_key_assumptions(
+                recent,
+                blend,
+                days,
+                bool(calibration_context),
+            ),
         }
 
     return {
@@ -112,8 +117,31 @@ def _naive_forecast(
     }
 
 
-def _build_key_assumptions(calibration_applied: bool) -> str:
-    assumptions = "Forecast extrapolates historical price trends and volatility; external news is not modeled."
+def _build_key_assumptions(
+    recent: pd.Series,
+    projected_price: float,
+    days: int,
+    calibration_applied: bool,
+) -> str:
+    latest_price = float(recent.iloc[-1])
+    projected_change = (projected_price / latest_price - 1) * 100
+    lookback = min(20, len(recent) - 1)
+    if lookback > 0:
+        recent_trend = (float(recent.iloc[-1]) / float(recent.iloc[-1 - lookback]) - 1) * 100
+        trend_text = f"The latest {lookback}-session price trend was {recent_trend:+.1f}%."
+    else:
+        trend_text = "There is not enough history to calculate a recent price trend."
+
+    returns = np.log(recent / recent.shift(1)).dropna()
+    annualized_volatility = float(returns.std() * np.sqrt(252) * 100) if len(returns) > 1 else 0.0
+    direction = "rise" if projected_change > 0 else "fall" if projected_change < 0 else "remain flat"
+    assumptions = (
+        f"Latest close was ${latest_price:.2f}. Projects a {abs(projected_change):.1f}% "
+        f"{direction} over about {days} calendar days. "
+        f"{trend_text} Historical annualized volatility was {annualized_volatility:.1f}%. "
+        "The estimate extrapolates price returns and volatility only; it does not model news, "
+        "fundamentals, or future market events."
+    )
     if calibration_applied:
         assumptions += " Recent forecast-error calibration was applied."
     return assumptions

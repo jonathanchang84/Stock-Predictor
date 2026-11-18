@@ -43,12 +43,24 @@ fn backend_is_compatible(port: u16) -> bool {
     let Some((headers, body)) = response.split_once("\r\n\r\n") else {
         return false;
     };
-    headers
+    if !headers
         .lines()
         .next()
         .is_some_and(|status| status.contains(" 200 "))
-        && body.contains("\"/api/news/search\"")
-        && body.contains("\"/api/assets/search\"")
+    {
+        return false;
+    }
+
+    let Ok(spec) = serde_json::from_str::<serde_json::Value>(body) else {
+        return false;
+    };
+    let paths = &spec["paths"];
+    spec["info"]["version"] == "0.1.3"
+        && paths["/api/news/search"].get("get").is_some()
+        && paths["/api/assets/search"].get("get").is_some()
+        && paths["/api/forecast"].get("post").is_some()
+        && paths["/api/assets/{ticker}"].get("put").is_some()
+        && paths["/api/assets/{ticker}"].get("delete").is_some()
 }
 
 fn select_backend_port() -> Result<(u16, bool), Box<dyn Error>> {

@@ -79,7 +79,7 @@ const NewsFeed: React.FC = () => {
       <div className="bg-surface-50 border border-surface-200 rounded-xl p-4">
         <h2 className="text-lg font-semibold text-surface-800 mb-2">News Sources</h2>
         <p className="text-sm text-surface-600">
-          Searches use configured Finnhub or Marketaux API keys when available, with Yahoo Finance, Reuters, and MarketWatch RSS feeds as a fallback.
+          Searches use configured Finnhub or Marketaux API keys when available, followed by Yahoo Finance search and query-specific Google News RSS.
         </p>
       </div>
     </div>

@@ -127,11 +127,23 @@ def delete_asset(ticker: str):
     normalized_ticker = ticker.strip().upper()
     conn = get_connection()
     try:
+        exists = conn.execute(
+            "SELECT 1 FROM assets WHERE ticker = ?",
+            (normalized_ticker,),
+        ).fetchone()
+        if not exists:
+            raise HTTPException(status_code=404, detail=f"Asset {normalized_ticker} not found")
+
+        conn.execute(
+            "DELETE FROM error_audits WHERE prediction_id IN "
+            "(SELECT id FROM predictions WHERE ticker = ?)",
+            (normalized_ticker,),
+        )
+        conn.execute("DELETE FROM predictions WHERE ticker = ?", (normalized_ticker,))
+        conn.execute("DELETE FROM catalyst_events WHERE ticker = ?", (normalized_ticker,))
+        conn.execute("DELETE FROM price_history WHERE ticker = ?", (normalized_ticker,))
         conn.execute("DELETE FROM forecast_accuracy WHERE ticker = ?", (normalized_ticker,))
         cursor = conn.execute("DELETE FROM assets WHERE ticker = ?", (normalized_ticker,))
-        if cursor.rowcount == 0:
-            conn.rollback()
-            raise HTTPException(status_code=404, detail=f"Asset {normalized_ticker} not found")
         conn.commit()
         return {"ticker": normalized_ticker, "message": "Asset deleted"}
     except HTTPException:
@@ -296,6 +308,7 @@ def search_news(query: str, limit: int = 20):
         sources.append(news_fetcher.FinnhubNewsSource(settings["finnhub_api_key"]))
     if settings.get("marketaux_api_key"):
         sources.append(news_fetcher.MarketauxNewsSource(settings["marketaux_api_key"]))
+    sources.append(news_fetcher.YahooFinanceNewsSource())
     sources.append(news_fetcher.RSSNewsSource())
 
     articles = news_fetcher.NewsFetcher(sources).search(search_term, limit=min(max(limit, 1), 50))

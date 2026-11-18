@@ -21,7 +21,7 @@ async def lifespan(app: FastAPI):
 app = FastAPI(
     title="Stock Predictor API",
     description="AI-powered stock and fund tracking, multi-horizon forecasting, event correlation, and self-learning error calibration.",
-    version="0.1.0",
+    version="0.1.3",
     lifespan=lifespan,
 )
 
@@ -35,7 +35,7 @@ app.include_router(core_router)
 
 @app.get("/api/health")
 def health():
-    return {"status": "ok", "service": "stock-predictor", "version": "0.1.0"}
+    return {"status": "ok", "service": "stock-predictor", "version": "0.1.3"}
 
 
 from .settings_routes import router as settings_router
