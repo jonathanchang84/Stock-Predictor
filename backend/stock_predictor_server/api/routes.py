@@ -8,6 +8,7 @@ from typing import Any
 from fastapi import APIRouter, HTTPException
 
 from ..core import error_auditor, forecast_service
+from ..core.backtester import walk_forward_backtest
 from ..core.prediction_engine import generate_forecast as build_forecast
 from ..db.connection import execute, executemany, fetch_all, fetch_one, get_connection
 from ..services import market_data, news_fetcher
@@ -302,6 +303,10 @@ def search_news(query: str, limit: int = 20):
     if not search_term:
         raise HTTPException(status_code=400, detail="query must not be empty")
 
+    return _search_news_articles(search_term, limit)
+
+
+def _search_news_articles(search_term: str, limit: int = 20) -> list[dict[str, str]]:
     settings = {row["key"]: row["value"] for row in fetch_all("SELECT key, value FROM app_settings")}
     sources: list[news_fetcher.NewsSource] = []
     if settings.get("finnhub_api_key"):
@@ -359,7 +364,7 @@ def generate_forecast(payload: dict[str, Any]):
     if isinstance(news_results, list) and news_results:
         news_context = news_results
     else:
-        news_context = [{"title": f"Relevant news for {news_query}", "summary": ""}]
+        news_context = _search_news_articles(ticker, limit=5)
 
     calibration = forecast_service._load_calibration_context(ticker, "tech" if "tech" in news_query.lower() else "general")
 
@@ -373,6 +378,21 @@ def generate_forecast(payload: dict[str, Any]):
     forecast_service.save_prediction(result)
 
     return result
+
+
+@router.get("/forecast/backtest/{ticker}")
+def backtest_forecasts(ticker: str):
+    normalized_ticker = ticker.strip().upper()
+    if not normalized_ticker:
+        raise HTTPException(status_code=400, detail="ticker is required")
+    rows = fetch_all(
+        "SELECT date, open, high, low, close, volume FROM price_history "
+        "WHERE ticker = ? ORDER BY date",
+        (normalized_ticker,),
+    )
+    if not rows:
+        raise HTTPException(status_code=404, detail=f"No price history for {normalized_ticker}")
+    return walk_forward_backtest(normalized_ticker, _price_history_frame(rows))
 
 
 @router.post("/run-daily-forecast")
@@ -389,6 +409,7 @@ def run_daily_forecast():
     for asset in assets:
         ticker = asset["ticker"]
         try:
+            _fetch_and_store_price_history(ticker)
             rows = fetch_all(
                 "SELECT date, open, high, low, close, volume FROM price_history WHERE ticker = ? ORDER BY date DESC",
                 (ticker,),
@@ -397,7 +418,7 @@ def run_daily_forecast():
                 continue
             df = _price_history_frame(rows)
 
-            news = [{"title": f"News for {ticker}", "summary": ""}]
+            news = _search_news_articles(ticker, limit=5)
             cal = forecast_service._load_calibration_context(ticker, "general")
 
             from ..core.prediction_engine import generate_forecast
@@ -408,18 +429,34 @@ def run_daily_forecast():
             logger.warning("Forecast failed for %s: %s", ticker, e)
             results.append({"ticker": ticker, "error": str(e)})
 
-    audits = fetch_all("SELECT ticker, horizon, percentage_error, directional_correct FROM error_audits JOIN predictions USING (prediction_id)")
-    agg = defaultdict(lambda: {"errors": [], "correct": 0, "total": 0})
+    audits = fetch_all(
+        "SELECT p.ticker, p.horizon, a.percentage_error, a.absolute_error, a.directional_correct "
+        "FROM error_audits a JOIN predictions p ON p.id = a.prediction_id "
+        "WHERE a.audit_date >= date('now', '-30 days')"
+    )
+    agg = defaultdict(lambda: {"percentage_errors": [], "absolute_errors": [], "correct": 0, "total": 0})
     for a in audits:
         key = (a["ticker"], a["horizon"])
-        agg[key]["errors"].append(a["percentage_error"] or 0)
+        agg[key]["percentage_errors"].append(a["percentage_error"] or 0)
+        agg[key]["absolute_errors"].append(a["absolute_error"] or 0)
         agg[key]["total"] += 1
         if a["directional_correct"] == 1:
             agg[key]["correct"] += 1
     for (ticker, horizon), vals in agg.items():
-        mape = sum(vals["errors"]) / len(vals["errors"]) if vals["errors"] else 0
+        mape = (
+            sum(vals["percentage_errors"]) / len(vals["percentage_errors"])
+            if vals["percentage_errors"]
+            else 0
+        )
+        mean_absolute_error = (
+            sum(vals["absolute_errors"]) / len(vals["absolute_errors"])
+            if vals["absolute_errors"]
+            else 0
+        )
         hit_rate = vals["correct"] / vals["total"] if vals["total"] else 0
-        forecast_service.upsert_forecast_accuracy(ticker, horizon, mape, hit_rate, sum(vals["errors"])/len(vals["errors"]) if vals["errors"] else 0, vals["total"])
+        forecast_service.upsert_forecast_accuracy(
+            ticker, horizon, mape, hit_rate, mean_absolute_error, vals["total"]
+        )
 
     return {"status": "ok", "audit_summary": audit_summary, "forecasts_generated": len(results), "results": results}
 

@@ -34,9 +34,22 @@ class YFinanceSource(DataSource):
         if self._yf is None:
             return None
         try:
-            data = (self._yf.download(ticker, start=start, end=end, interval=interval, progress=False)
-                    if hasattr(self._yf, "download")
-                    else self._yf.Ticker(ticker).history(start=start, end=end, interval=interval))
+            if hasattr(self._yf, "download"):
+                data = self._yf.download(
+                    ticker,
+                    start=start,
+                    end=end,
+                    interval=interval,
+                    auto_adjust=True,
+                    progress=False,
+                )
+            else:
+                data = self._yf.Ticker(ticker).history(
+                    start=start,
+                    end=end,
+                    interval=interval,
+                    auto_adjust=True,
+                )
             if data is not None and not data.empty:
                 return data
         except Exception as e:

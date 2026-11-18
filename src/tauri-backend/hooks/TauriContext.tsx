@@ -1,12 +1,13 @@
 import { invoke, isTauri } from "@tauri-apps/api/core";
 import { createContext, useCallback, useContext, useEffect, useRef, useState } from "react";
-import type { Asset, AssetSearchResult, PriceHistoryPoint, CatalystEvent, ErrorAudit, ForecastAccuracy, AppSettings, ForecastResult, NewsArticle } from "./types";
+import type { Asset, AssetSearchResult, PriceHistoryPoint, CatalystEvent, ErrorAudit, ForecastAccuracy, AppSettings, ForecastBacktestResult, ForecastResult, NewsArticle } from "./types";
 
 export interface TauriContextValue {
   assets: Asset[];
   priceHistory: Record<string, PriceHistoryPoint[]>;
   catalysts: Record<string, CatalystEvent[]>;
   predictions: Record<string, ForecastResult["predictions"]>;
+  forecastNews: Record<string, NewsArticle[]>;
   errorAudits: Record<string, ErrorAudit[]>;
   forecastAccuracy: Record<string, ForecastAccuracy[]>;
   settings: AppSettings;
@@ -17,6 +18,7 @@ export interface TauriContextValue {
   fetchPriceHistory: (ticker: string) => Promise<void>;
   fetchCatalysts: (ticker: string) => Promise<void>;
   fetchForecast: (ticker: string) => Promise<ForecastResult | null>;
+  runForecastBacktest: (ticker: string) => Promise<ForecastBacktestResult | null>;
   fetchErrorAudits: (ticker: string) => Promise<void>;
   fetchErrorSummary: (ticker: string) => Promise<void>;
   fetchForecastAccuracy: () => Promise<void>;
@@ -37,6 +39,7 @@ interface TauriState {
   priceHistory: Record<string, PriceHistoryPoint[]>;
   catalysts: Record<string, CatalystEvent[]>;
   predictions: Record<string, ForecastResult["predictions"]>;
+  forecastNews: Record<string, NewsArticle[]>;
   errorAudits: Record<string, ErrorAudit[]>;
   forecastAccuracy: Record<string, ForecastAccuracy[]>;
   settings: AppSettings;
@@ -83,6 +86,7 @@ export const TauriProvider: React.FC<{ children: React.ReactNode }> = ({ childre
     priceHistory: {},
     catalysts: {},
     predictions: {},
+    forecastNews: {},
     errorAudits: {},
     forecastAccuracy: {},
     settings: {},
@@ -151,9 +155,18 @@ export const TauriProvider: React.FC<{ children: React.ReactNode }> = ({ childre
       setState((current) => ({
         ...current,
         predictions: { ...current.predictions, [ticker]: result.predictions },
+        forecastNews: { ...current.forecastNews, [ticker]: result.news_context },
       }));
     }
     return result;
+  }, [runRequest]);
+
+  const runForecastBacktest = useCallback(async (ticker: string) => {
+    return runRequest(() =>
+      apiRequest<ForecastBacktestResult>(
+        `/api/forecast/backtest/${encodeURIComponent(ticker)}`,
+      ),
+    );
   }, [runRequest]);
 
   const fetchErrorAudits = useCallback(async (ticker: string) => {
@@ -273,14 +286,16 @@ export const TauriProvider: React.FC<{ children: React.ReactNode }> = ({ childre
       const priceHistory = { ...current.priceHistory };
       const catalysts = { ...current.catalysts };
       const predictions = { ...current.predictions };
+      const forecastNews = { ...current.forecastNews };
       const errorAudits = { ...current.errorAudits };
       const forecastAccuracy = { ...current.forecastAccuracy };
       delete priceHistory[ticker];
       delete catalysts[ticker];
       delete predictions[ticker];
+      delete forecastNews[ticker];
       delete errorAudits[ticker];
       delete forecastAccuracy[ticker];
-      return { ...current, assets, priceHistory, catalysts, predictions, errorAudits, forecastAccuracy };
+      return { ...current, assets, priceHistory, catalysts, predictions, forecastNews, errorAudits, forecastAccuracy };
     });
     return true;
   }, [runRequest]);
@@ -312,6 +327,7 @@ export const TauriProvider: React.FC<{ children: React.ReactNode }> = ({ childre
         fetchPriceHistory,
         fetchCatalysts,
         fetchForecast,
+        runForecastBacktest,
         fetchErrorAudits,
         fetchErrorSummary,
         fetchForecastAccuracy,

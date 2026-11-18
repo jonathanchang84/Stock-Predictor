@@ -1,5 +1,6 @@
 import tempfile
 import unittest
+import sqlite3
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from unittest.mock import patch
@@ -9,9 +10,11 @@ from fastapi import HTTPException
 
 from stock_predictor_server.api import main, routes
 from stock_predictor_server.api.routes import _normalize_price_history
+from stock_predictor_server.core.backtester import walk_forward_backtest
 from stock_predictor_server.core import error_auditor, forecast_service
-from stock_predictor_server.core.prediction_engine import generate_forecast
+from stock_predictor_server.core.prediction_engine import MODEL_VERSION, generate_forecast
 from stock_predictor_server.db import connection
+from stock_predictor_server.services.market_data import YFinanceSource
 from stock_predictor_server.services.news_fetcher import RSSNewsSource, YahooFinanceNewsSource
 
 
@@ -45,10 +48,135 @@ class PriceHistoryNormalizationTests(unittest.TestCase):
         self.assertIn("recent 20-session momentum", predictions["1m"]["key_assumptions"])
         self.assertIn("nominal baseline", predictions["20y"]["key_assumptions"])
         self.assertIn("capped at -8% to +12%", predictions["20y"]["key_assumptions"])
+        self.assertGreater(predictions["20y"]["high"], predictions["20y"]["low"])
+        self.assertEqual(predictions["20y"]["interval_coverage"], 0.9)
+        self.assertIn("not backtest-calibrated", predictions["20y"]["interval_method"])
         annualized_20y_change = (
             (predictions["20y"]["predicted_price"] / closes[-1]) ** (365.25 / 7300) - 1
         )
         self.assertLessEqual(annualized_20y_change, 0.1201)
+
+    def test_signed_horizon_residuals_correct_only_matching_forecasts(self):
+        closes = [100.0 + index * 0.1 for index in range(1500)]
+        data = pd.DataFrame(
+            {"close": closes},
+            index=pd.bdate_range("2018-01-01", periods=len(closes)),
+        )
+        history = {"residuals": [0.1] * 20}
+
+        baseline = generate_forecast("ACME", data, [], {}, "2025-01-01T00:00:00Z")
+        corrected = generate_forecast(
+            "ACME",
+            data,
+            [],
+            {"horizons": {"1d": history, "7d": {"residuals": [0.1]}}},
+            "2025-01-01T00:00:00Z",
+        )
+
+        self.assertGreater(
+            corrected["predictions"]["1d"]["predicted_price"],
+            baseline["predictions"]["1d"]["predicted_price"],
+        )
+        self.assertEqual(
+            corrected["predictions"]["7d"]["predicted_price"],
+            baseline["predictions"]["7d"]["predicted_price"],
+        )
+        self.assertEqual(corrected["predictions"]["1d"]["interval_sample_size"], 20)
+        self.assertIn("historical 90%", corrected["predictions"]["1d"]["interval_method"])
+        self.assertIn(
+            "Recent forecast-error calibration was applied.",
+            corrected["predictions"]["1d"]["key_assumptions"],
+        )
+        self.assertNotIn(
+            "Recent forecast-error calibration was applied.",
+            corrected["predictions"]["7d"]["key_assumptions"],
+        )
+
+    def test_forecast_returns_only_sourced_http_news_context(self):
+        data = pd.DataFrame(
+            {"close": [40.0 + index for index in range(25)]},
+            index=pd.date_range("2025-01-01", periods=25),
+        )
+
+        forecast = generate_forecast(
+            "ACME",
+            data,
+            [
+                {"title": "Quarterly results", "url": "https://example.test/results", "source": "Example"},
+                {"title": "Unsafe link", "url": "javascript:alert(1)", "source": "Example"},
+                "not-an-article",
+            ],
+            {},
+            "2025-01-26T00:00:00Z",
+        )
+
+        self.assertEqual(
+            forecast["news_context"],
+            [
+                {
+                    "title": "Quarterly results",
+                    "url": "https://example.test/results",
+                    "source": "Example",
+                    "published": "",
+                }
+            ],
+        )
+
+    def test_walk_forward_backtest_uses_past_only_and_compares_flat_baseline(self):
+        data = pd.DataFrame(
+            {"close": [50.0 + index * 0.05 for index in range(800)]},
+            index=pd.bdate_range("2022-01-03", periods=800),
+        )
+        forecast_dates = []
+
+        def fake_forecast(_ticker, history, _news, _calibration, today):
+            forecast_dates.append((history.index[-1], today))
+            return {
+                "predictions": {
+                    horizon: {
+                        "predicted_price": float(history["close"].iloc[-1]),
+                        "low": float(history["close"].iloc[-1] * 0.9),
+                        "high": float(history["close"].iloc[-1] * 1.1),
+                    }
+                    for horizon in ("1d", "7d", "1m", "6m", "1y", "3y", "5y", "10y", "20y")
+                }
+            }
+
+        with patch("stock_predictor_server.core.backtester.generate_forecast", fake_forecast):
+            result = walk_forward_backtest("ACME", data, minimum_train_rows=252, step_rows=63)
+
+        self.assertGreater(result["horizons"]["1d"]["sample_size"], 0)
+        self.assertIsNotNone(result["horizons"]["1d"]["baseline"])
+        self.assertEqual(result["horizons"]["20y"]["sample_size"], 0)
+        self.assertTrue(all(history_date.strftime("%Y-%m-%d") == today[:10] for history_date, today in forecast_dates))
+
+    def test_backtest_route_evaluates_saved_price_history(self):
+        original_path = connection.DB_PATH
+        try:
+            with tempfile.TemporaryDirectory() as directory:
+                connection.DB_PATH = Path(directory) / "backtest-route.db"
+                connection.initialize_database()
+                start = datetime(2024, 1, 1)
+                connection.execute(
+                    "INSERT INTO assets (ticker, asset_type, name, date_added) VALUES (?, ?, ?, ?)",
+                    ("ACME", "stock", "Example", "2024-01-01"),
+                )
+                connection.executemany(
+                    "INSERT INTO price_history (ticker, date, close) VALUES (?, ?, ?)",
+                    [
+                        ("ACME", (start + timedelta(days=index)).date().isoformat(), 50 + index * 0.05)
+                        for index in range(300)
+                    ],
+                )
+
+                result = routes.backtest_forecasts("acme")
+
+                self.assertEqual(result["ticker"], "ACME")
+                self.assertEqual(result["model_version"], MODEL_VERSION)
+                self.assertGreater(result["horizons"]["1d"]["sample_size"], 0)
+                self.assertIn("flat last-close baseline", result["methodology"])
+        finally:
+            connection.DB_PATH = original_path
 
     def test_short_history_forecast_uses_latest_close_not_fixed_price(self):
         data = pd.DataFrame(
@@ -81,6 +209,22 @@ class PriceHistoryNormalizationTests(unittest.TestCase):
             _normalize_price_history("ACME", data),
             [("ACME", "2025-01-02", 10.0, 12.0, 9.0, 11.0, 100)],
         )
+
+    def test_yfinance_fetches_split_and_dividend_adjusted_ohlcv(self):
+        class FakeYFinance:
+            kwargs = None
+
+            def download(self, _ticker, **kwargs):
+                self.kwargs = kwargs
+                return pd.DataFrame({"Close": [10.0]})
+
+        source = YFinanceSource()
+        source._yf = FakeYFinance()
+
+        result = source.fetch_ohlcv("ACME", "2025-01-01", "2025-02-01")
+
+        self.assertIsNotNone(result)
+        self.assertTrue(source._yf.kwargs["auto_adjust"])
 
     def test_rejects_market_data_without_required_fields(self):
         data = pd.DataFrame({"Close": [11.0]}, index=[pd.Timestamp("2025-01-02")])
@@ -146,7 +290,7 @@ class RSSNewsSourceTests(unittest.TestCase):
 
         self.assertIn("/api/news/search", paths)
         self.assertIn("/api/assets/search", paths)
-        self.assertEqual(main.app.version, "0.1.4")
+        self.assertEqual(main.app.version, "0.1.5")
 
     def test_search_assets_returns_ticker_and_name(self):
         class FakeSearch:
@@ -299,6 +443,50 @@ class DatabaseInitializationTests(unittest.TestCase):
         finally:
             connection.DB_PATH = original_path
 
+    def test_migrates_existing_prediction_table_with_new_forecast_metadata(self):
+        original_path = connection.DB_PATH
+        try:
+            with tempfile.TemporaryDirectory() as directory:
+                connection.DB_PATH = Path(directory) / "old-schema.db"
+                with sqlite3.connect(connection.DB_PATH) as conn:
+                    conn.execute(
+                        """CREATE TABLE predictions (
+                            id INTEGER PRIMARY KEY AUTOINCREMENT,
+                            prediction_date TEXT NOT NULL,
+                            ticker TEXT NOT NULL,
+                            horizon TEXT NOT NULL,
+                            predicted_price REAL NOT NULL DEFAULT 0,
+                            low REAL NOT NULL DEFAULT 0,
+                            high REAL NOT NULL DEFAULT 0,
+                            confidence_interval REAL NOT NULL DEFAULT 0.95,
+                            sentiment_score REAL NOT NULL DEFAULT 0,
+                            key_assumptions TEXT NOT NULL DEFAULT '',
+                            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                        )"""
+                    )
+                    conn.execute(
+                        "INSERT INTO predictions (prediction_date, ticker, horizon, predicted_price) "
+                        "VALUES (?, ?, ?, ?)",
+                        ("2025-01-01", "ACME", "1d", 100.0),
+                    )
+
+                connection.initialize_database()
+
+                columns = {
+                    row["name"]
+                    for row in connection.fetch_all("PRAGMA table_info(predictions)")
+                }
+                legacy = connection.fetch_one(
+                    "SELECT model_version, interval_coverage, interval_method FROM predictions"
+                )
+                self.assertTrue(
+                    {"model_version", "interval_coverage", "interval_method"} <= columns
+                )
+                self.assertEqual(legacy["model_version"], "legacy")
+                self.assertEqual(legacy["interval_method"], "legacy")
+        finally:
+            connection.DB_PATH = original_path
+
     def test_prediction_saves_and_calibration_uses_schema_columns(self):
         original_path = connection.DB_PATH
         try:
@@ -325,16 +513,79 @@ class DatabaseInitializationTests(unittest.TestCase):
                     }
                 )
                 rows = connection.fetch_all(
-                    "SELECT predicted_price FROM predictions WHERE ticker = ?",
+                    "SELECT predicted_price, interval_coverage, interval_method, model_version "
+                    "FROM predictions WHERE ticker = ?",
                     ("ACME",),
                 )
 
                 self.assertEqual(inserted, 1)
                 self.assertEqual(rows[0]["predicted_price"], 42.75)
+                self.assertEqual(rows[0]["interval_coverage"], 0.9)
+                self.assertEqual(rows[0]["model_version"], "legacy")
                 self.assertEqual(
                     forecast_service._load_calibration_context("ACME", "general"),
-                    {"bias_correction": 0.0, "temper_bullish": False},
+                    {"horizons": {}},
                 )
+        finally:
+            connection.DB_PATH = original_path
+
+    def test_calibration_uses_signed_horizon_residuals_from_current_model_only(self):
+        original_path = connection.DB_PATH
+        try:
+            with tempfile.TemporaryDirectory() as directory:
+                connection.DB_PATH = Path(directory) / "forecast-calibration.db"
+                connection.initialize_database()
+                connection.execute(
+                    "INSERT INTO assets (ticker, asset_type, name, date_added) VALUES (?, ?, ?, ?)",
+                    ("ACME", "stock", "Example", "2025-01-01"),
+                )
+                forecast_service.save_prediction(
+                    {
+                        "ticker": "ACME",
+                        "model_version": MODEL_VERSION,
+                        "predictions": {
+                            horizon: {
+                                "prediction_date": "2025-01-02T00:00:00Z",
+                                "predicted_price": 100.0,
+                                "interval_coverage": 0.9,
+                                "interval_method": "test",
+                                "low": 90.0,
+                                "high": 110.0,
+                            }
+                            for horizon in ("1d", "7d")
+                        },
+                    }
+                )
+                current = connection.fetch_all(
+                    "SELECT id, horizon FROM predictions WHERE model_version = ?",
+                    (MODEL_VERSION,),
+                )
+                for prediction in current:
+                    actual = 90.0 if prediction["horizon"] == "1d" else 110.0
+                    connection.execute(
+                        "INSERT INTO error_audits "
+                        "(prediction_id, audit_date, actual_close, absolute_error, percentage_error, directional_correct) "
+                        "VALUES (?, ?, ?, ?, ?, ?)",
+                        (prediction["id"], "2025-01-03", actual, 10.0, 10.0, 0),
+                    )
+
+                legacy_id = connection.execute(
+                    "INSERT INTO predictions "
+                    "(ticker, horizon, prediction_date, predicted_price, model_version) "
+                    "VALUES (?, ?, ?, ?, ?)",
+                    ("ACME", "1d", "2025-01-02T00:00:00Z", 50.0, "legacy"),
+                )
+                connection.execute(
+                    "INSERT INTO error_audits "
+                    "(prediction_id, audit_date, actual_close, absolute_error, percentage_error, directional_correct) "
+                    "VALUES (?, ?, ?, ?, ?, ?)",
+                    (legacy_id, "2025-01-03", 100.0, 50.0, 50.0, 1),
+                )
+
+                context = forecast_service._load_calibration_context("ACME", "general")
+
+                self.assertAlmostEqual(context["horizons"]["1d"]["residuals"][0], -0.1)
+                self.assertAlmostEqual(context["horizons"]["7d"]["residuals"][0], 0.1)
         finally:
             connection.DB_PATH = original_path
 
@@ -357,9 +608,22 @@ class DatabaseInitializationTests(unittest.TestCase):
                         ("ACME", day.date().isoformat(), price, price, price, price, 1000),
                     )
 
-                result = routes.generate_forecast({"ticker": "ACME"})
+                with patch.object(
+                    routes,
+                    "_search_news_articles",
+                    return_value=[
+                        {
+                            "title": "Company update",
+                            "url": "https://example.test/news",
+                            "source": "Example",
+                            "published": "2025-01-02",
+                        }
+                    ],
+                ):
+                    result = routes.generate_forecast({"ticker": "ACME"})
 
                 self.assertEqual(len(result["predictions"]), 9)
+                self.assertEqual(result["news_context"][0]["title"], "Company update")
                 self.assertEqual(
                     connection.fetch_one("SELECT COUNT(*) AS count FROM predictions")["count"],
                     9,
@@ -386,18 +650,18 @@ class DatabaseInitializationTests(unittest.TestCase):
 
                 def tracked_fetch_all(query, *args, **kwargs):
                     queries.append(query)
-                    if "FROM error_audits JOIN predictions" in query:
-                        return []
                     return original_fetch_all(query, *args, **kwargs)
 
-                with patch.object(error_auditor, "audit_predictions", return_value={"audited": 0}):
-                    with patch.object(routes, "fetch_all", side_effect=tracked_fetch_all):
-                        with patch(
-                            "stock_predictor_server.core.prediction_engine.generate_forecast",
-                            return_value={"ticker": "ACME", "predictions": {}},
-                        ):
-                            with patch.object(forecast_service, "save_prediction"):
-                                routes.run_daily_forecast()
+                with patch.object(routes, "_fetch_and_store_price_history"):
+                    with patch.object(routes, "_search_news_articles", return_value=[]):
+                        with patch.object(error_auditor, "audit_predictions", return_value={"audited": 0}):
+                            with patch.object(routes, "fetch_all", side_effect=tracked_fetch_all):
+                                with patch(
+                                    "stock_predictor_server.core.prediction_engine.generate_forecast",
+                                    return_value={"ticker": "ACME", "predictions": {}},
+                                ):
+                                    with patch.object(forecast_service, "save_prediction"):
+                                        routes.run_daily_forecast()
 
                 price_queries = [
                     query for query in queries if "FROM price_history" in query

@@ -13,7 +13,9 @@ export default defineConfig({
     },
   },
   server: {
+    host: 'localhost',
     port: 1420,
+    strictPort: true,
   },
   build: {
     rollupOptions: {

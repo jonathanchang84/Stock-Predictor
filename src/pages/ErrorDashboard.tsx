@@ -1,14 +1,35 @@
 import React from "react";
 import { useTauri } from "../tauri-backend/hooks";
+import type { ForecastBacktestResult } from "../tauri-backend/hooks/types";
 import { LineChart, Line, XAxis, YAxis, CartesianGrid, Tooltip, ResponsiveContainer } from "recharts";
 
 const ErrorDashboard: React.FC = () => {
-  const { assets, errorAudits, fetchErrorAudits, fetchErrorSummary } = useTauri();
+  const { assets, errorAudits, loading, fetchErrorAudits, fetchErrorSummary, runForecastBacktest } = useTauri();
   const [activeTicker, setActiveTicker] = React.useState<string | null>(null);
+  const [backtest, setBacktest] = React.useState<ForecastBacktestResult | null>(null);
+  const [backtestError, setBacktestError] = React.useState<string | null>(null);
 
   React.useEffect(() => {
     if (activeTicker) { fetchErrorAudits(activeTicker); fetchErrorSummary(activeTicker); }
   }, [activeTicker, fetchErrorAudits, fetchErrorSummary]);
+
+  React.useEffect(() => {
+    setBacktest(null);
+    setBacktestError(null);
+  }, [activeTicker]);
+
+  const handleBacktest = async () => {
+    if (!activeTicker) {
+      return;
+    }
+    setBacktestError(null);
+    const result = await runForecastBacktest(activeTicker);
+    if (result) {
+      setBacktest(result);
+    } else {
+      setBacktestError("Could not run the backtest. Review the API error and try again.");
+    }
+  };
 
   if (assets.length === 0) {
     return (<div className="text-center py-12"><h1 className="text-2xl font-bold text-surface-800 mb-4">Error Audit Dashboard</h1><p className="text-surface-500">Add assets to see prediction error calibration.</p></div>);
@@ -27,6 +48,65 @@ const ErrorDashboard: React.FC = () => {
 
       {activeTicker && (
         <div className="space-y-4">
+          <div className="rounded-xl border border-surface-200 bg-surface-50 p-4">
+            <div className="flex flex-wrap items-center justify-between gap-3">
+              <div>
+                <h3 className="font-semibold text-surface-800">Historical walk-forward backtest</h3>
+                <p className="text-xs text-surface-500">
+                  Evaluates forecasts made from earlier data against a flat last-close baseline.
+                </p>
+              </div>
+              <button
+                type="button"
+                onClick={() => void handleBacktest()}
+                disabled={loading}
+                className="rounded-lg border border-surface-300 px-3 py-2 text-sm text-surface-700 disabled:opacity-50"
+              >
+                {loading ? "Running..." : "Run backtest"}
+              </button>
+            </div>
+            {backtestError && <p role="alert" className="mt-2 text-sm text-red-600">{backtestError}</p>}
+            {backtest && (
+              <>
+                <p className="mt-2 text-xs text-surface-500">{backtest.methodology}</p>
+                <div className="mt-3 overflow-x-auto">
+                  <table className="w-full text-sm">
+                    <thead>
+                      <tr className="border-b border-surface-200 text-left text-surface-500">
+                        <th className="py-2">Horizon</th>
+                        <th className="py-2">Samples</th>
+                        <th className="py-2">Model MAPE</th>
+                        <th className="py-2">Baseline MAPE</th>
+                        <th className="py-2">Direction hit rate</th>
+                        <th className="py-2">Range coverage</th>
+                      </tr>
+                    </thead>
+                    <tbody>
+                      {Object.entries(backtest.horizons).map(([horizon, result]) => (
+                        <tr key={horizon} className="border-b border-surface-100">
+                          <td className="py-2">{horizon}</td>
+                          <td className="py-2">{result.sample_size}</td>
+                          <td className="py-2">{result.model ? `${result.model.mape.toFixed(2)}%` : "—"}</td>
+                          <td className="py-2">{result.baseline ? `${result.baseline.mape.toFixed(2)}%` : "—"}</td>
+                          <td className="py-2">
+                            {result.model?.directional_hit_rate === undefined
+                              ? "—"
+                              : `${(result.model.directional_hit_rate * 100).toFixed(1)}%`}
+                          </td>
+                          <td className="py-2">
+                            {result.model?.interval_coverage === undefined
+                              ? "—"
+                              : `${(result.model.interval_coverage * 100).toFixed(1)}%`}
+                          </td>
+                        </tr>
+                      ))}
+                    </tbody>
+                  </table>
+                </div>
+              </>
+            )}
+          </div>
+
           <div className="grid grid-cols-1 sm:grid-cols-4 gap-4">
             <div className="bg-surface-50 border border-surface-200 rounded-xl p-4"><div className="text-sm text-surface-500">Total Audits</div><div className="text-2xl font-bold text-surface-800">{errorAudits[activeTicker]?.length || 0}</div></div>
             <div className="bg-surface-50 border border-surface-200 rounded-xl p-4"><div className="text-sm text-surface-500">Avg MAPE</div><div className="text-2xl font-bold text-amber-600">{((errorAudits[activeTicker]?.reduce((s: number, a: any) => s + a.percentage_error, 0) || 0) / (errorAudits[activeTicker]?.length || 1)).toFixed(2)}%</div></div>

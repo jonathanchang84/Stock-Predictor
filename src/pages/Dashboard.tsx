@@ -13,6 +13,7 @@ const Dashboard: React.FC = () => {
     errorAudits,
     catalysts,
     predictions,
+    forecastNews,
     loading,
     error,
     addAsset,
@@ -276,6 +277,7 @@ const Dashboard: React.FC = () => {
           forecasts={predictions[selectedTicker]}
           latestPrice={latestPrice}
           historyCount={selectedHistory.length}
+          news={forecastNews[selectedTicker] ?? []}
         />
       )}
 

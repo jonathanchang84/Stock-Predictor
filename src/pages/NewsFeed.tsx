@@ -1,21 +1,10 @@
 import React from "react";
-import { openUrl } from "@tauri-apps/plugin-opener";
-import { isTauri } from "@tauri-apps/api/core";
 import { useTauri } from "../tauri-backend/hooks";
-
-const getSafeArticleUrl = (value: string): string | null => {
-  try {
-    const url = new URL(value);
-    return url.protocol === "https:" || url.protocol === "http:" ? url.href : null;
-  } catch {
-    return null;
-  }
-};
+import ExternalLink from "../components/ExternalLink";
 
 const NewsFeed: React.FC = () => {
   const { news, loading, error, searchNews } = useTauri();
   const [query, setQuery] = React.useState("markets");
-  const [linkError, setLinkError] = React.useState<string | null>(null);
 
   React.useEffect(() => {
     void searchNews("markets");
@@ -26,25 +15,6 @@ const NewsFeed: React.FC = () => {
     const searchTerm = query.trim();
     if (searchTerm) {
       void searchNews(searchTerm);
-    }
-  };
-
-  const handleArticleClick = async (
-    event: React.MouseEvent<HTMLAnchorElement>,
-    url: string,
-  ) => {
-    if (!isTauri()) {
-      return;
-    }
-
-    event.preventDefault();
-    setLinkError(null);
-    try {
-      await openUrl(url);
-    } catch (openError) {
-      setLinkError(
-        `Could not open article link: ${openError instanceof Error ? openError.message : String(openError)}`,
-      );
     }
   };
 
@@ -75,13 +45,11 @@ const NewsFeed: React.FC = () => {
       </div>
 
       {error && <div role="alert" className="text-sm text-red-600">News search failed: {error}</div>}
-      {linkError && <div role="alert" className="text-sm text-red-600">{linkError}</div>}
       {loading && <div className="text-surface-500">Searching news...</div>}
 
       {news.length > 0 ? (
         <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-4">
           {news.map((item, index) => {
-            const articleUrl = getSafeArticleUrl(item.url);
             return (
               <article
                 key={`${item.url}-${item.title}-${index}`}
@@ -94,16 +62,10 @@ const NewsFeed: React.FC = () => {
                   )}
                 </div>
                 <h2 className="font-semibold text-surface-800 mb-1">
-                  {articleUrl ? (
-                    <a
-                      href={articleUrl}
-                      target="_blank"
-                      rel="noreferrer"
-                      onClick={(event) => void handleArticleClick(event, articleUrl)}
-                      className="hover:text-brand-600"
-                    >
+                  {item.url ? (
+                    <ExternalLink href={item.url} className="hover:text-brand-600">
                       {item.title}
-                    </a>
+                    </ExternalLink>
                   ) : item.title}
                 </h2>
                 <p className="text-sm text-surface-600">{item.summary}</p>

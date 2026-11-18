@@ -37,6 +37,19 @@ def initialize_database() -> None:
     conn = get_connection()
     try:
         conn.executescript(schema_path.read_text(encoding="utf-8"))
+        columns = {
+            row["name"]
+            for row in conn.execute("PRAGMA table_info(predictions)").fetchall()
+        }
+        migrations = {
+            "interval_coverage": "REAL NOT NULL DEFAULT 0.9",
+            "interval_method": "TEXT NOT NULL DEFAULT 'legacy'",
+            "model_version": "TEXT NOT NULL DEFAULT 'legacy'",
+        }
+        for column, declaration in migrations.items():
+            if column not in columns:
+                conn.execute(f"ALTER TABLE predictions ADD COLUMN {column} {declaration}")
+        conn.commit()
     finally:
         conn.close()
 

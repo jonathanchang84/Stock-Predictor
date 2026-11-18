@@ -11,6 +11,7 @@ const AssetDetail: React.FC = () => {
     priceHistory,
     catalysts,
     predictions,
+    forecastNews,
     errorAudits,
     error,
     loading,
@@ -82,6 +83,7 @@ const AssetDetail: React.FC = () => {
           forecasts={forecast}
           latestPrice={latestPrice}
           historyCount={history.length}
+          news={forecastNews[ticker] ?? []}
         />
       )}
 

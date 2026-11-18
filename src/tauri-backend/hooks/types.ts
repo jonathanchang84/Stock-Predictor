@@ -89,16 +89,42 @@ export interface HorizonForecast {
   horizon: string;
   predicted_price: number;
   confidence_interval: number;
+  interval_coverage: number;
+  low: number;
+  high: number;
+  interval_method: string;
+  interval_sample_size: number;
   sentiment_score: number;
   key_assumptions: string;
 }
 
 export interface ForecastResult {
   ticker: string;
+  model_version: string;
   generated_at: string;
   predictions: Record<string, HorizonForecast>;
+  news_context: NewsArticle[];
   confidence_band: Record<string, number>;
   calibration_context_applied: boolean;
+}
+
+export interface BacktestMetrics {
+  mae: number;
+  mape: number;
+  directional_hit_rate?: number;
+  interval_coverage?: number;
+}
+
+export interface ForecastBacktestResult {
+  ticker: string;
+  model_version: string;
+  as_of: string | null;
+  methodology: string;
+  horizons: Record<string, {
+    sample_size: number;
+    model: BacktestMetrics | null;
+    baseline: BacktestMetrics | null;
+  }>;
 }
 
 export interface NewsArticle {

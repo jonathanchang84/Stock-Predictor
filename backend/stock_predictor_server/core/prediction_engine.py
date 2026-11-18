@@ -1,4 +1,4 @@
-"""Multi-horizon forecast generation with hybrid statistical + LLM approach.
+"""Multi-horizon price-only forecasts with horizon-specific statistical baselines.
 
 Generates projections for 9 exact horizons: 1d, 7d, 1m, 6m, 1y, 3y, 5y, 10y, 20y.
 """
@@ -14,6 +14,9 @@ logger = logging.getLogger(__name__)
 
 # Exact forecast horizons (must match horizon enum)
 HORIZONS = ["1d", "7d", "1m", "6m", "1y", "3y", "5y", "10y", "20y"]
+MODEL_VERSION = "price-momentum-v3"
+INTERVAL_COVERAGE = 0.9
+MIN_CALIBRATION_SAMPLES = 20
 
 # Days-per-period conversions
 DAYS = {"1d": 1, "7d": 7, "1m": 30, "6m": 180, "1y": 365, "3y": 1095, "5y": 1825, "10y": 3650, "20y": 7300}
@@ -22,11 +25,11 @@ DAYS = {"1d": 1, "7d": 7, "1m": 30, "6m": 180, "1y": 365, "3y": 1095, "5y": 1825
 def generate_forecast(
     ticker: str,
     price_history: pd.DataFrame,
-    news_context: dict[str, Any],
+    news_context: list[dict[str, Any]],
     calibration_context: dict[str, Any],
     today: str,
 ) -> dict[str, Any]:
-    """Produce forecasts for all 9 horizons, mixing statistical baselines with LLM."""
+    """Produce forecasts for all horizons and attach sourced news as context only."""
     if price_history is None or len(price_history) < 20:
         logger.warning("Insufficient price history for %s (%d rows); using naive baseline",
                        ticker, len(price_history) if price_history is not None else 0)
@@ -70,12 +73,13 @@ def generate_forecast(
                 "projection capped at -8% to +12% annualized."
             )
 
-        if calibration_context:
-            bias = calibration_context.get("bias_correction", 0.0)
-            temper_bullish = calibration_context.get("temper_bullish", False)
-            if temper_bullish:
-                blend = blend * 0.85
-            blend += bias
+        horizon_calibration = calibration_context.get("horizons", {}).get(h, {})
+        residuals = horizon_calibration.get("residuals", [])
+        if len(residuals) >= MIN_CALIBRATION_SAMPLES:
+            median_residual = float(np.median(residuals))
+            shrinkage = len(residuals) / (len(residuals) + MIN_CALIBRATION_SAMPLES)
+            correction = float(np.clip(median_residual * shrinkage, -0.1, 0.1))
+            blend *= 1 + correction
 
         if days > 180:
             years = days / 365.25
@@ -88,10 +92,20 @@ def generate_forecast(
                 )
             )
 
+        low, high, interval_method, interval_sample_size = _prediction_interval(
+            recent,
+            blend,
+            days,
+            residuals,
+        )
         predictions[h] = {
             "predicted_price": round(max(blend, 0.01), 2),
-            "confidence_interval": round(blend * (1 - calibration_context.get("ci_width", 0.1)), 2)
-                                   if calibration_context else round(blend * 0.9, 2),
+            "confidence_interval": INTERVAL_COVERAGE,
+            "interval_coverage": INTERVAL_COVERAGE,
+            "low": round(low, 2),
+            "high": round(high, 2),
+            "interval_method": interval_method,
+            "interval_sample_size": interval_sample_size,
             "sentiment_score": short_term.get("sentiment_score", 0.0),
             "horizon": h,
             "prediction_date": today,
@@ -99,23 +113,28 @@ def generate_forecast(
                 recent,
                 blend,
                 days,
-                bool(calibration_context),
+                len(residuals) >= MIN_CALIBRATION_SAMPLES,
                 model_explanation,
             ),
         }
 
     return {
         "ticker": ticker,
+        "model_version": MODEL_VERSION,
         "generated_at": datetime.now(timezone.utc).isoformat(timespec="seconds").replace("+00:00", "Z"),
         "predictions": predictions,
+        "news_context": _normalize_news_context(news_context),
         "confidence_band": {
-            "1d": predictions["1d"]["confidence_interval"],
-            "7d": predictions["7d"]["confidence_interval"],
-            "1m": predictions["1m"]["confidence_interval"],
-            "6m": predictions["6m"]["confidence_interval"],
-            "1y": predictions["1y"]["confidence_interval"],
+            "1d": predictions["1d"]["low"],
+            "7d": predictions["7d"]["low"],
+            "1m": predictions["1m"]["low"],
+            "6m": predictions["6m"]["low"],
+            "1y": predictions["1y"]["low"],
         },
-        "calibration_context_applied": bool(calibration_context),
+        "calibration_context_applied": any(
+            len(context.get("residuals", [])) >= MIN_CALIBRATION_SAMPLES
+            for context in calibration_context.get("horizons", {}).values()
+        ),
     }
 
 
@@ -132,14 +151,73 @@ def _naive_forecast(
 
     return {
         "ticker": ticker,
+        "model_version": MODEL_VERSION,
         "generated_at": datetime.now(timezone.utc).isoformat(timespec="seconds").replace("+00:00", "Z"),
-        "predictions": {h: {"predicted_price": latest_price, "confidence_interval": latest_price,
+        "predictions": {h: {"predicted_price": latest_price, "confidence_interval": INTERVAL_COVERAGE,
+                            "interval_coverage": INTERVAL_COVERAGE,
+                            "low": latest_price, "high": latest_price,
+                            "interval_method": "unavailable: insufficient price history",
+                            "interval_sample_size": 0,
                             "sentiment_score": 0.0, "horizon": h, "prediction_date": today,
                             "key_assumptions": "Insufficient historical data; using flat baseline."}
                         for h in HORIZONS},
+        "news_context": [],
         "confidence_band": {},
         "calibration_context_applied": False,
     }
+
+
+def _normalize_news_context(news_context: list[dict[str, Any]]) -> list[dict[str, str]]:
+    normalized = []
+    for article in news_context:
+        if not isinstance(article, dict):
+            continue
+        title = str(article.get("title") or "").strip()
+        url = str(article.get("url") or "").strip()
+        if not title or not url.startswith(("https://", "http://")):
+            continue
+        normalized.append(
+            {
+                "title": title,
+                "url": url,
+                "source": str(article.get("source") or "News"),
+                "published": str(article.get("published") or ""),
+            }
+        )
+    return normalized[:5]
+
+
+def _prediction_interval(
+    recent: pd.Series,
+    projected_price: float,
+    days: int,
+    residuals: list[float],
+) -> tuple[float, float, str, int]:
+    if len(residuals) >= MIN_CALIBRATION_SAMPLES:
+        residual_array = np.asarray(residuals, dtype=float)
+        median_residual = float(np.median(residual_array))
+        low_residual, high_residual = np.quantile(residual_array, [0.05, 0.95])
+        low = projected_price * (1 + float(low_residual) - median_residual)
+        high = projected_price * (1 + float(high_residual) - median_residual)
+        return (
+            max(float(low), 0.01),
+            max(float(high), float(low), 0.01),
+            "historical 90% residual interval",
+            len(residuals),
+        )
+
+    returns = np.log(recent / recent.shift(1)).dropna().tail(252)
+    daily_volatility = float(returns.std()) if len(returns) > 1 else 0.0
+    trading_days = max(days * 252 / 365.25, 1)
+    log_spread = min(50.0, 1.6448536269514722 * daily_volatility * np.sqrt(trading_days))
+    low = projected_price * np.exp(-log_spread)
+    high = projected_price * np.exp(log_spread)
+    return (
+        max(float(low), 0.01),
+        float(high),
+        "historical-volatility estimate; not backtest-calibrated",
+        len(returns),
+    )
 
 
 def _build_key_assumptions(
